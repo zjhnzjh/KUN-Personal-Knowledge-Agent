@@ -1,0 +1,61 @@
+{
+  "name": "document_skill",
+  "version": "0.2.0",
+  "description": "Parse, summarize, compare and retrieve grounded document evidence.",
+  "input_schema": {
+    "type": "object",
+    "required": ["goal"],
+    "properties": {
+      "goal": {
+        "type": "string",
+        "enum": ["parse", "summarize", "compare", "answer"]
+      },
+      "document_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "query": {
+        "type": "string"
+      },
+      "space_id": {
+        "type": "string"
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "answer": {
+        "type": "string"
+      },
+      "citations": {
+        "type": "array"
+      },
+      "artifacts": {
+        "type": "array"
+      }
+    }
+  },
+  "tools": [
+    "document.parse",
+    "file.search",
+    "rag.search"
+  ],
+  "read_scope": [
+    "kun_library",
+    "kun_index"
+  ],
+  "write_scope": [
+    "kun_exports"
+  ],
+  "requires_confirmation_for_write": true,
+  "timeout_seconds": 120,
+  "recoverable_errors": [
+    "file_not_found",
+    "parse_failed",
+    "tool_unavailable",
+    "permission_denied"
+  ]
+}

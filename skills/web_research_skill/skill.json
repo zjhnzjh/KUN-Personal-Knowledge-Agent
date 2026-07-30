@@ -1,0 +1,51 @@
+{
+  "name": "web_research_skill",
+  "version": "0.1.0",
+  "description": "Research public web sources with explicit provenance and import only after user confirmation.",
+  "input_schema": {
+    "type": "object",
+    "required": ["query"],
+    "properties": {
+      "query": {
+        "type": "string"
+      },
+      "import_to_space": {
+        "type": ["string", "null"]
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "answer": {
+        "type": "string"
+      },
+      "sources": {
+        "type": "array"
+      },
+      "import_proposal": {
+        "type": ["object", "null"]
+      }
+    }
+  },
+  "tools": [
+    "web.search",
+    "web.fetch",
+    "rag.search"
+  ],
+  "read_scope": [
+    "public_web",
+    "kun_index"
+  ],
+  "write_scope": [
+    "kun_staging"
+  ],
+  "requires_confirmation_for_write": true,
+  "timeout_seconds": 120,
+  "recoverable_errors": [
+    "network_unavailable",
+    "source_blocked",
+    "unsupported_content",
+    "permission_denied"
+  ]
+}

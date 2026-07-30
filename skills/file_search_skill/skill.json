@@ -1,0 +1,50 @@
+{
+  "name": "file_search_skill",
+  "version": "0.2.0",
+  "description": "Search approved local library metadata and content without modifying sources.",
+  "input_schema": {
+    "type": "object",
+    "required": ["query"],
+    "properties": {
+      "query": {
+        "type": "string"
+      },
+      "space_id": {
+        "type": ["string", "null"]
+      },
+      "file_types": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "files": {
+        "type": "array"
+      },
+      "content_matches": {
+        "type": "array"
+      }
+    }
+  },
+  "tools": [
+    "file.search",
+    "rag.search"
+  ],
+  "read_scope": [
+    "kun_library",
+    "approved_watch_folders",
+    "kun_index"
+  ],
+  "write_scope": [],
+  "requires_confirmation_for_write": false,
+  "timeout_seconds": 30,
+  "recoverable_errors": [
+    "index_unavailable",
+    "path_denied"
+  ]
+}

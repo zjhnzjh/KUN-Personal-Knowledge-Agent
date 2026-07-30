@@ -1,0 +1,74 @@
+{
+  "name": "video_skill",
+  "version": "0.1.0",
+  "description": "Understand user-approved local videos through metadata, timestamped transcription, keyframes, OCR and grounded retrieval.",
+  "input_schema": {
+    "type": "object",
+    "required": ["source"],
+    "properties": {
+      "source": {
+        "type": "string",
+        "description": "A confirmed local-library video path or an explicitly provided permitted URL."
+      },
+      "goal": {
+        "type": "string",
+        "enum": ["summarize", "index", "answer", "find_moment"]
+      },
+      "space_id": {
+        "type": "string"
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["status", "source"],
+    "properties": {
+      "status": {
+        "type": "string"
+      },
+      "source": {
+        "type": "object"
+      },
+      "chapters": {
+        "type": "array"
+      },
+      "citations": {
+        "type": "array",
+        "description": "Timestamp locators such as 00:03:24-00:03:41."
+      }
+    }
+  },
+  "tools": [
+    "video.probe",
+    "video.transcribe",
+    "video.sample_frames",
+    "document.parse",
+    "rag.search"
+  ],
+  "read_scope": [
+    "kun_library"
+  ],
+  "write_scope": [
+    "kun_derived",
+    "kun_index"
+  ],
+  "network_scope": [
+    "explicit_user_url"
+  ],
+  "requires_confirmation_for_write": true,
+  "timeout_seconds": 1800,
+  "recoverable_errors": [
+    "dependency_missing",
+    "unsupported_video",
+    "video_probe_failed",
+    "transcription_failed",
+    "permission_denied"
+  ],
+  "copyright_policy": {
+    "personal_research_only": true,
+    "preserve_attribution": true,
+    "store_source_url_and_creator_when_available": true,
+    "no_access_control_bypass": true,
+    "no_original_media_redistribution": true
+  }
+}

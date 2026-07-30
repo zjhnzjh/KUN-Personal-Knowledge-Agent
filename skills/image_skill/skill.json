@@ -1,0 +1,63 @@
+{
+  "name": "image_skill",
+  "version": "0.2.0",
+  "description": "Run OCR, create image descriptions and search image semantics.",
+  "input_schema": {
+    "type": "object",
+    "required": ["goal"],
+    "properties": {
+      "goal": {
+        "type": "string",
+        "enum": ["ocr", "describe", "search", "answer"]
+      },
+      "document_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "query": {
+        "type": ["string", "null"]
+      },
+      "space_id": {
+        "type": ["string", "null"]
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "description": {
+        "type": ["string", "null"]
+      },
+      "ocr_text": {
+        "type": ["string", "null"]
+      },
+      "matches": {
+        "type": "array"
+      },
+      "region_citations": {
+        "type": "array"
+      }
+    }
+  },
+  "tools": [
+    "document.parse",
+    "rag.search"
+  ],
+  "read_scope": [
+    "kun_library",
+    "kun_index"
+  ],
+  "write_scope": [
+    "kun_derived"
+  ],
+  "requires_confirmation_for_write": true,
+  "timeout_seconds": 120,
+  "recoverable_errors": [
+    "ocr_unavailable",
+    "vision_unavailable",
+    "unsupported_image",
+    "permission_denied"
+  ]
+}

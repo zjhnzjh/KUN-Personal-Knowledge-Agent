@@ -1,0 +1,60 @@
+{
+  "name": "excel_skill",
+  "version": "0.2.0",
+  "description": "Understand workbook structure, analyze sheets and preview derived files.",
+  "input_schema": {
+    "type": "object",
+    "required": ["goal", "document_id"],
+    "properties": {
+      "goal": {
+        "type": "string",
+        "enum": ["inspect", "query", "summarize", "derive"]
+      },
+      "document_id": {
+        "type": "string"
+      },
+      "sheet": {
+        "type": ["string", "null"]
+      },
+      "range": {
+        "type": ["string", "null"]
+      },
+      "query": {
+        "type": ["string", "null"]
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "answer": {
+        "type": "string"
+      },
+      "cell_citations": {
+        "type": "array"
+      },
+      "preview_artifact": {
+        "type": ["object", "null"]
+      }
+    }
+  },
+  "tools": [
+    "document.parse",
+    "rag.search"
+  ],
+  "read_scope": [
+    "kun_library",
+    "kun_index"
+  ],
+  "write_scope": [
+    "kun_exports"
+  ],
+  "requires_confirmation_for_write": true,
+  "timeout_seconds": 180,
+  "recoverable_errors": [
+    "sheet_not_found",
+    "invalid_range",
+    "formula_unsupported",
+    "permission_denied"
+  ]
+}

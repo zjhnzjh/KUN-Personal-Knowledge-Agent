@@ -1,0 +1,13 @@
+{
+  "name": "recommendation_skill",
+  "version": "0.1.0",
+  "description": "Find current local dining, travel, activity and service recommendations with explicit sources.",
+  "input_schema": {"type":"object","required":["query"],"properties":{"query":{"type":"string"},"location":{"type":["string","null"]},"constraints":{"type":"array","items":{"type":"string"}}}},
+  "output_schema": {"type":"object","properties":{"recommendations":{"type":"array"},"sources":{"type":"array"},"uncertainties":{"type":"array"}}},
+  "tools": ["web.search", "web.fetch"],
+  "read_scope": ["public_web"],
+  "write_scope": [],
+  "requires_confirmation_for_write": false,
+  "timeout_seconds": 120,
+  "recoverable_errors": ["network_unavailable", "source_blocked", "insufficient_current_sources", "permission_denied"]
+}
