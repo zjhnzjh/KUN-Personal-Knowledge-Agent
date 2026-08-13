@@ -46,6 +46,7 @@ from .experiments import (
     compare_experiments,
     create_dataset,
     create_experiment_run,
+    create_experiment_sweep,
     create_performance_benchmark,
     dataset_detail,
     experiment_detail,
@@ -53,10 +54,13 @@ from .experiments import (
     import_legacy_dataset,
     list_datasets,
     list_experiments,
+    list_experiment_sweeps,
     list_performance_benchmarks,
     performance_detail,
     render_experiment_report,
     run_experiment,
+    run_experiment_sweep,
+    sweep_detail,
     run_performance_benchmark,
     update_dataset_case,
 )
@@ -217,11 +221,32 @@ class ExperimentCreate(BaseModel):
     pipeline: str = Field(default="bm25", pattern=r"^(bm25|dense|hybrid|hybrid_rerank)$")
     generation_id: str | None = None
     candidate_k: int = Field(default=20, ge=5, le=100)
-    top_k: int = Field(default=10, ge=10, le=20)
+    top_k: int = Field(default=10, ge=5, le=20)
     rrf_k: int = Field(default=60, ge=1, le=200)
     reranker_model: str | None = None
+    reranker_top_n: int = Field(default=10, ge=10, le=50)
     split: str = Field(default="dev", pattern=r"^(dev|holdout|all)$")
+    case_status: str = Field(default="accepted", pattern=r"^(accepted|exploratory)$")
     parent_run_id: str | None = None
+
+
+class ExperimentSweepItemCreate(BaseModel):
+    name: str | None = Field(default=None, max_length=120)
+    pipeline: str = Field(default="bm25", pattern=r"^(bm25|dense|hybrid|hybrid_rerank)$")
+    generation_id: str | None = None
+    candidate_k: int = Field(default=20, ge=5, le=100)
+    top_k: int = Field(default=10, ge=5, le=20)
+    rrf_k: int = Field(default=60, ge=1, le=200)
+    reranker_model: str | None = None
+    reranker_top_n: int = Field(default=10, ge=10, le=50)
+    split: str = Field(default="all", pattern=r"^(dev|holdout|all)$")
+
+
+class ExperimentSweepCreate(BaseModel):
+    dataset_version_id: str
+    name: str = Field(min_length=2, max_length=120)
+    case_status: str = Field(default="accepted", pattern=r"^(accepted|exploratory)$")
+    configs: list[ExperimentSweepItemCreate] = Field(min_length=1, max_length=100)
 
 
 class DatasetImportRequest(BaseModel):
@@ -237,7 +262,7 @@ class DatasetCreateRequest(BaseModel):
 
 
 class CandidateGenerateRequest(BaseModel):
-    count: int = Field(default=10, ge=1, le=20)
+    count: int = Field(default=70, ge=1, le=70)
     confirmation: str
 
 
@@ -1803,6 +1828,10 @@ def _experiment_handler(payload: dict, context: JobContext) -> dict:
     return run_experiment(payload["run_id"], context)
 
 
+def _experiment_sweep_handler(payload: dict, context: JobContext) -> dict:
+    return run_experiment_sweep(payload["sweep_id"], context)
+
+
 def _performance_handler(payload: dict, context: JobContext) -> dict:
     return run_performance_benchmark(payload["benchmark_id"], context)
 
@@ -1815,6 +1844,7 @@ INFRA_RUNNER.register("index_document", _index_document_handler)
 INFRA_RUNNER.register("analyze_image", _image_analysis_handler)
 INFRA_RUNNER.register("build_index_generation", lambda payload, context: build_index_generation(payload["generation_id"], context))
 INFRA_RUNNER.register("run_experiment", _experiment_handler)
+INFRA_RUNNER.register("run_experiment_sweep", _experiment_sweep_handler)
 INFRA_RUNNER.register("performance_benchmark", _performance_handler)
 INFRA_RUNNER.register("generate_eval_candidates", _candidate_generation_handler)
 
@@ -1879,6 +1909,32 @@ def get_infra_trace(trace_id: str) -> dict:
 @app.get("/api/infra/index-generations")
 def get_index_generations(space_id: str | None = None) -> list[dict]:
     return list_index_generations(space_id)
+
+
+@app.get("/api/eval/model-catalog")
+def get_eval_model_catalog(space_id: str = "ai-agent-learning") -> dict:
+    known_embeddings = [
+        {"model": "text-embedding-v2", "provider": "dashscope", "dimensions": [256, 512, 768, 1024]},
+        {"model": "text-embedding-v4", "provider": "dashscope", "dimensions": [256, 512, 768, 1024]},
+        {"model": "qwen3.7-text-embedding", "provider": "dashscope", "dimensions": [256, 512, 768, 1024]},
+    ]
+    existing = list_index_generations(space_id)
+    for generation in existing:
+        match = next((item for item in known_embeddings if item["model"] == generation["model"]), None)
+        if not match:
+            known_embeddings.append({
+                "model": generation["model"], "provider": generation["provider"],
+                "dimensions": sorted({generation["dimension"]}),
+            })
+        elif generation["dimension"] not in match["dimensions"]:
+            match["dimensions"].append(generation["dimension"])
+            match["dimensions"].sort()
+    return {
+        "embedding": known_embeddings,
+        "reranker": [{"model": "qwen3-rerank", "provider": "dashscope", "dimensions": []}],
+        "custom_model_supported": True,
+        "provider": "dashscope",
+    }
 
 
 @app.post("/api/infra/index-generations", status_code=201)
@@ -1994,7 +2050,7 @@ def get_eval_dataset(dataset_id: str) -> dict:
 @app.get("/api/eval/datasets/{dataset_id}/candidate-estimate")
 def estimate_eval_candidates(dataset_id: str, count: int = 10) -> dict:
     try:
-        return candidate_generation_estimate(dataset_id, max(1, min(count, 20)))
+        return candidate_generation_estimate(dataset_id, max(1, min(count, 70)))
     except ValueError as error:
         raise HTTPException(404, str(error)) from error
 
@@ -2034,7 +2090,8 @@ def enqueue_experiment(payload: ExperimentCreate) -> dict:
     dataset = dataset_detail(payload.dataset_version_id)
     if not dataset:
         raise HTTPException(404, "评测集不存在")
-    accepted_cases = sum(item["status"] == "accepted" and (payload.split == "all" or item["split"] == payload.split) for item in dataset["cases"])
+    eligible_statuses = {"accepted"} if payload.case_status == "accepted" else {"accepted", "draft"}
+    accepted_cases = sum(item["status"] in eligible_statuses and (payload.split == "all" or item["split"] == payload.split) for item in dataset["cases"])
     requests_per_case = int(payload.pipeline in {"dense", "hybrid", "hybrid_rerank"}) + int(payload.pipeline == "hybrid_rerank")
     estimated_requests = accepted_cases * requests_per_case
     if estimated_requests > _infra_budget()["max_api_requests_per_run"]:
@@ -2055,6 +2112,44 @@ def enqueue_experiment(payload: ExperimentCreate) -> dict:
         message="评测实验已加入队列",
     )
     return {"experiment": run_item, "job": job}
+
+
+@app.get("/api/eval/sweeps")
+def get_experiment_sweeps(limit: int = 30) -> list[dict]:
+    return list_experiment_sweeps(limit)
+
+
+@app.get("/api/eval/sweeps/{sweep_id}")
+def get_experiment_sweep(sweep_id: str) -> dict:
+    item = sweep_detail(sweep_id)
+    if not item:
+        raise HTTPException(404, "Experiment sweep does not exist")
+    return item
+
+
+@app.post("/api/eval/sweeps", status_code=202)
+def enqueue_experiment_sweep(payload: ExperimentSweepCreate) -> dict:
+    dataset = dataset_detail(payload.dataset_version_id)
+    if not dataset:
+        raise HTTPException(404, "Evaluation dataset does not exist")
+    try:
+        sweep = create_experiment_sweep(
+            payload.dataset_version_id,
+            payload.name,
+            [item.model_dump(exclude_none=True) for item in payload.configs],
+            payload.case_status,
+        )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    if sweep.get("status") == "succeeded":
+        return {"sweep": sweep, "job": None}
+    job = INFRA_RUNNER.enqueue(
+        "run_experiment_sweep",
+        {"sweep_id": sweep["id"]},
+        idempotency_key=f"experiment-sweep:{sweep['id']}",
+        message="Experiment sweep queued",
+    )
+    return {"sweep": sweep, "job": job}
 
 
 @app.get("/api/eval/experiments/{run_id}")

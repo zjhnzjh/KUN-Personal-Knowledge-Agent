@@ -34,6 +34,7 @@ class RetrievalConfig:
     generation_id: str | None = None
     candidate_k: int = 20
     top_k: int = 5
+    reranker_top_n: int = 10
     rrf_k: int = 60
     reranker_model: str | None = None
 
@@ -47,6 +48,7 @@ class RetrievalConfig:
             generation_id=value.get("generation_id"),
             candidate_k=max(5, min(int(value.get("candidate_k", 20)), 100)),
             top_k=max(1, min(int(value.get("top_k", 5)), 20)),
+            reranker_top_n=max(10, min(int(value.get("reranker_top_n", 10)), 50)),
             rrf_k=max(1, min(int(value.get("rrf_k", 60)), 200)),
             reranker_model=value.get("reranker_model") or ("qwen3-rerank" if pipeline == "hybrid_rerank" else None),
         )
@@ -67,7 +69,29 @@ class DashScopeEmbeddingAdapter:
     def encode(self, texts: list[str], text_type: str) -> tuple[list[list[float]], dict[str, Any]]:
         if not self.available:
             raise CapabilityUnavailable("百炼 Embedding 未配置")
+        input_characters = sum(len(text) for text in texts)
+        query_hash = hashlib.sha256(texts[0].encode("utf-8")).hexdigest() if text_type == "query" and len(texts) == 1 else None
+        if query_hash:
+            cached = rows(
+                "SELECT embedding_json FROM eval_query_embedding_cache WHERE query_hash=? AND provider=? AND model=? AND dimension=? AND text_type=?",
+                (query_hash, self.provider, self.model, self.dimension, text_type),
+            )
+            if cached:
+                return [json.loads(cached[0]["embedding_json"])], {
+                    "provider": self.provider,
+                    "model": self.model,
+                    "dimension": self.dimension,
+                    "input_count": len(texts),
+                    "input_characters": input_characters,
+                    "usage": {},
+                    "usage_source": "cache",
+                    "cache_hit": True,
+                    "request_count": 0,
+                    "provider_duration_ms": 0,
+                    "text_type": text_type,
+                }
         last_error: Exception | None = None
+        provider_started = perf_counter()
         for attempt in range(3):
             try:
                 response = httpx.post(
@@ -83,13 +107,23 @@ class DashScopeEmbeddingAdapter:
                 if any(len(vector) != self.dimension for vector in vectors):
                     raise ValueError("Embedding dimension does not match the requested index dimension")
                 usage = payload.get("usage") or {}
+                if query_hash:
+                    with connect() as db:
+                        db.execute(
+                            "INSERT OR REPLACE INTO eval_query_embedding_cache(query_hash,provider,model,dimension,text_type,embedding_json,created_at) VALUES(?,?,?,?,?,?,?)",
+                            (query_hash, self.provider, self.model, self.dimension, text_type, json_value(vectors[0]), now()),
+                        )
                 return vectors, {
                     "provider": self.provider,
                     "model": self.model,
                     "dimension": self.dimension,
                     "input_count": len(texts),
+                    "input_characters": input_characters,
                     "usage": usage,
                     "usage_source": "provider" if usage else "unavailable",
+                    "cache_hit": False,
+                    "request_count": 1,
+                    "provider_duration_ms": round((perf_counter() - provider_started) * 1000, 2),
                     "text_type": text_type,
                 }
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
@@ -114,6 +148,39 @@ class DashScopeRerankerAdapter:
     def rerank(self, query: str, candidates: list[dict], top_n: int) -> tuple[list[dict], dict[str, Any]]:
         if not self.available:
             raise CapabilityUnavailable("百炼 Reranker 地址尚未配置")
+        query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+        candidate_hash = hashlib.sha256(
+            json_value([str(item.get("id")) for item in candidates]).encode("utf-8")
+        ).hexdigest()
+        bounded_top_n = min(top_n, len(candidates))
+        cached = rows(
+            "SELECT result_json FROM eval_rerank_cache WHERE query_hash=? AND candidate_hash=? AND model=? AND top_n=?",
+            (query_hash, candidate_hash, self.model, bounded_top_n),
+        )
+        input_characters = sum(len(str(item.get("text", ""))) for item in candidates)
+        if cached:
+            cached_results = json.loads(cached[0]["result_json"] or "[]")
+            ranked = []
+            for rank, result in enumerate(cached_results, 1):
+                index = int(result["index"])
+                if 0 <= index < len(candidates):
+                    ranked.append({
+                        **candidates[index],
+                        "rerank_rank": rank,
+                        "rerank_score": round(float(result.get("relevance_score", 0)), 6),
+                    })
+            return ranked, {
+                "provider": self.provider,
+                "model": self.model,
+                "input_count": len(candidates),
+                "output_count": len(ranked),
+                "input_characters": input_characters,
+                "usage": {},
+                "cache_hit": True,
+                "request_count": 0,
+                "provider_duration_ms": 0,
+            }
+        provider_started = perf_counter()
         response = httpx.post(
             f"{self.settings.dashscope_rerank_base_url}/reranks",
             headers={"Authorization": f"Bearer {self.settings.dashscope_api_key}"},
@@ -121,7 +188,7 @@ class DashScopeRerankerAdapter:
                 "model": self.model,
                 "query": query,
                 "documents": [item["text"] for item in candidates],
-                "top_n": min(top_n, len(candidates)),
+                "top_n": bounded_top_n,
                 "instruct": "Given a search query, retrieve passages that directly answer the query.",
             },
             timeout=90,
@@ -129,6 +196,11 @@ class DashScopeRerankerAdapter:
         response.raise_for_status()
         payload = response.json()
         results = payload.get("results") or []
+        with connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO eval_rerank_cache(query_hash,candidate_hash,model,top_n,result_json,created_at) VALUES(?,?,?,?,?,?)",
+                (query_hash, candidate_hash, self.model, bounded_top_n, json_value(results), now()),
+            )
         ranked: list[dict] = []
         for rank, result in enumerate(results, 1):
             index = int(result["index"])
@@ -145,6 +217,10 @@ class DashScopeRerankerAdapter:
             "input_count": len(candidates),
             "output_count": len(ranked),
             "usage": payload.get("usage") or {},
+            "input_characters": input_characters,
+            "cache_hit": False,
+            "request_count": 1,
+            "provider_duration_ms": round((perf_counter() - provider_started) * 1000, 2),
         }
 
 
@@ -614,6 +690,29 @@ def pipeline_search(
     trace_id = create_trace(trace_type, "retrieval_pipeline", {"space_id": space_id, **asdict(config)})
     started = perf_counter()
     stage_details: list[dict[str, Any]] = []
+    latency_breakdown: dict[str, float] = {
+        "local_bm25_ms": 0,
+        "local_faiss_ms": 0,
+        "embedding_provider_ms": 0,
+        "local_rrf_ms": 0,
+        "rerank_provider_ms": 0,
+        "total_ms": 0,
+    }
+    embedding_usage: dict[str, Any] = {}
+    rerank_usage: dict[str, Any] = {}
+
+    def snapshot(items: list[dict], rank_field: str | None = None) -> list[dict]:
+        result: list[dict] = []
+        for rank, item in enumerate(items, 1):
+            result.append({
+                "chunk_id": item.get("id"),
+                "document_id": item.get("document_id"),
+                "locator": item.get("locator"),
+                "rank": int(item.get(rank_field, rank)) if rank_field and item.get(rank_field) else rank,
+                "score": item.get("score") or item.get("vector_score") or item.get("rerank_score"),
+            })
+        return result
+
     try:
         lexical: list[dict] = []
         dense: list[dict] = []
@@ -622,15 +721,23 @@ def pipeline_search(
             with trace_span(trace_id, "bm25_search", "bm25_search", attributes={"candidate_k": config.candidate_k}) as span:
                 lexical = _lexical_candidates(query, space_id, config.candidate_k, config.generation_id)
                 span.annotate(output_count=len(lexical))
-            stage_details.append({"stage": "bm25", "duration_ms": round((perf_counter() - stage_started) * 1000, 2), "count": len(lexical)})
+            latency_breakdown["local_bm25_ms"] = round((perf_counter() - stage_started) * 1000, 2)
+            stage_details.append({"stage": "bm25", "duration_ms": latency_breakdown["local_bm25_ms"], "count": len(lexical), "cache_hit": False})
         if config.pipeline in {"dense", "hybrid", "hybrid_rerank"}:
             if not config.generation_id:
                 raise CapabilityUnavailable("Dense pipeline requires an index generation")
             stage_started = perf_counter()
             with trace_span(trace_id, "vector_search", "vector_search", attributes={"candidate_k": config.candidate_k}) as span:
-                dense, usage = _dense_candidates(query, space_id, config.generation_id, config.candidate_k)
-                span.annotate(output_count=len(dense), **usage)
-            stage_details.append({"stage": "dense", "duration_ms": round((perf_counter() - stage_started) * 1000, 2), "count": len(dense)})
+                dense, embedding_usage = _dense_candidates(query, space_id, config.generation_id, config.candidate_k)
+                span.annotate(output_count=len(dense), **embedding_usage)
+            dense_total_ms = round((perf_counter() - stage_started) * 1000, 2)
+            latency_breakdown["embedding_provider_ms"] = float(embedding_usage.get("provider_duration_ms") or 0)
+            latency_breakdown["local_faiss_ms"] = round(max(0, dense_total_ms - latency_breakdown["embedding_provider_ms"]), 2)
+            stage_details.append({
+                "stage": "dense", "duration_ms": dense_total_ms, "count": len(dense),
+                "cache_hit": bool(embedding_usage.get("cache_hit")),
+                "provider_duration_ms": latency_breakdown["embedding_provider_ms"],
+            })
         candidates: dict[str, dict] = {}
         for rank, item in enumerate(lexical, 1):
             candidates[item["id"]] = {**item, "lexical_rank": rank}
@@ -652,29 +759,65 @@ def pipeline_search(
             for rank, item in enumerate(fused, 1):
                 item["fusion_rank"] = rank
             span.annotate(input_count=len(candidates), output_count=len(fused))
-        stage_details.append({"stage": "fusion", "duration_ms": round((perf_counter() - stage_started) * 1000, 2), "count": len(fused)})
+        latency_breakdown["local_rrf_ms"] = round((perf_counter() - stage_started) * 1000, 2)
+        stage_details.append({"stage": "fusion", "duration_ms": latency_breakdown["local_rrf_ms"], "count": len(fused), "cache_hit": False})
+        fusion_snapshot = snapshot(fused, "fusion_rank")
         if config.reranker_model:
             stage_started = perf_counter()
             reranker = DashScopeRerankerAdapter(config.reranker_model)
             with trace_span(trace_id, "rerank", "rerank", attributes={"model": config.reranker_model}) as span:
-                fused, usage = reranker.rerank(query, fused[:config.candidate_k], config.top_k)
-                span.annotate(**usage)
-            stage_details.append({"stage": "rerank", "duration_ms": round((perf_counter() - stage_started) * 1000, 2), "count": len(fused)})
-        results: list[dict] = []
+                fused, rerank_usage = reranker.rerank(query, fused[:config.candidate_k], config.reranker_top_n)
+                span.annotate(**rerank_usage)
+            rerank_total_ms = round((perf_counter() - stage_started) * 1000, 2)
+            latency_breakdown["rerank_provider_ms"] = float(rerank_usage.get("provider_duration_ms") or 0)
+            stage_details.append({
+                "stage": "rerank", "duration_ms": rerank_total_ms, "count": len(fused),
+                "cache_hit": bool(rerank_usage.get("cache_hit")),
+                "provider_duration_ms": latency_breakdown["rerank_provider_ms"],
+            })
+        evaluation_results: list[dict] = []
         per_document: dict[str, int] = {}
         for item in fused:
             document_id = item["document_id"]
             if per_document.get(document_id, 0) >= 2:
                 continue
-            results.append(item)
+            evaluation_results.append(item)
             per_document[document_id] = per_document.get(document_id, 0) + 1
-            if len(results) >= config.top_k:
+            if len(evaluation_results) >= max(10, config.top_k):
                 break
+        results = evaluation_results[:config.top_k]
+        final_snapshot = snapshot(results, "rerank_rank" if config.reranker_model else "fusion_rank")
+        evaluation_snapshot = snapshot(evaluation_results, "rerank_rank" if config.reranker_model else "fusion_rank")
         duration_ms = round((perf_counter() - started) * 1000, 2)
+        latency_breakdown["total_ms"] = duration_ms
         finish_trace(trace_id, duration_ms=round(duration_ms), attributes={
             "space_id": space_id, **asdict(config), "result_count": len(results), "stage_count": len(stage_details),
+            "latency_breakdown": latency_breakdown,
         })
-        return {"trace_id": trace_id, "duration_ms": duration_ms, "stages": stage_details, "results": results, "config": asdict(config)}
+        return {
+            "trace_id": trace_id,
+            "duration_ms": duration_ms,
+            "stages": stage_details,
+            "stage_results": {
+                "bm25": snapshot(lexical, "lexical_rank"),
+                "dense": snapshot(dense, "vector_rank"),
+                "fusion": fusion_snapshot,
+                "rerank": snapshot(fused, "rerank_rank") if config.reranker_model else [],
+                "evaluation": evaluation_snapshot,
+                "final": final_snapshot,
+            },
+            "latency_breakdown": latency_breakdown,
+            "api_stats": {
+                "embedding_requests": int(embedding_usage.get("request_count") or 0),
+                "rerank_requests": int(rerank_usage.get("request_count") or 0),
+                "embedding_cache_hits": int(bool(embedding_usage.get("cache_hit"))),
+                "rerank_cache_hits": int(bool(rerank_usage.get("cache_hit"))),
+                "embedding_input_characters": int(embedding_usage.get("input_characters") or 0),
+                "rerank_input_characters": int(rerank_usage.get("input_characters") or 0),
+            },
+            "results": results,
+            "config": asdict(config),
+        }
     except Exception as error:
         finish_trace(
             trace_id,

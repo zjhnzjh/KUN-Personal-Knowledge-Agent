@@ -226,6 +226,21 @@ CREATE TABLE IF NOT EXISTS experiment_runs (
   created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_experiment_runs_created ON experiment_runs(created_at DESC);
+CREATE TABLE IF NOT EXISTS experiment_sweeps (
+  id TEXT PRIMARY KEY, dataset_version_id TEXT NOT NULL REFERENCES eval_dataset_versions(id),
+  name TEXT NOT NULL, status TEXT NOT NULL, config_json TEXT NOT NULL,
+  config_hash TEXT NOT NULL, case_status TEXT NOT NULL DEFAULT 'accepted',
+  estimated_requests INTEGER NOT NULL DEFAULT 0, estimated_input_characters INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error_code TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_experiment_sweeps_created ON experiment_sweeps(created_at DESC);
+CREATE TABLE IF NOT EXISTS experiment_sweep_items (
+  sweep_id TEXT NOT NULL REFERENCES experiment_sweeps(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL, run_id TEXT NOT NULL REFERENCES experiment_runs(id) ON DELETE CASCADE,
+  status TEXT NOT NULL, error_code TEXT, started_at TEXT, finished_at TEXT,
+  PRIMARY KEY(sweep_id,ordinal), UNIQUE(sweep_id,run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_experiment_sweep_items_status ON experiment_sweep_items(sweep_id,status,ordinal);
 CREATE TABLE IF NOT EXISTS experiment_case_results (
   run_id TEXT NOT NULL REFERENCES experiment_runs(id) ON DELETE CASCADE,
   case_id TEXT NOT NULL REFERENCES eval_dataset_cases(id) ON DELETE CASCADE,
@@ -236,6 +251,16 @@ CREATE TABLE IF NOT EXISTS performance_benchmarks (
   id TEXT PRIMARY KEY, status TEXT NOT NULL, config_json TEXT NOT NULL,
   result_json TEXT NOT NULL DEFAULT '{}', machine_json TEXT NOT NULL,
   error_code TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS eval_query_embedding_cache (
+  query_hash TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+  dimension INTEGER NOT NULL, text_type TEXT NOT NULL, embedding_json TEXT NOT NULL,
+  created_at TEXT NOT NULL, PRIMARY KEY(query_hash,provider,model,dimension,text_type)
+);
+CREATE TABLE IF NOT EXISTS eval_rerank_cache (
+  query_hash TEXT NOT NULL, candidate_hash TEXT NOT NULL, model TEXT NOT NULL,
+  top_n INTEGER NOT NULL, result_json TEXT NOT NULL, created_at TEXT NOT NULL,
+  PRIMARY KEY(query_hash,candidate_hash,model,top_n)
 );
 """
 

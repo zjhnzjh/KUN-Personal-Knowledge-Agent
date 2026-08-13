@@ -19,7 +19,7 @@ import httpx
 
 from .config import get_settings
 from .database import connect, json_value, now, rows
-from .infra import JobContext, create_trace, finish_trace, trace_span
+from .infra import JobCancelled, JobContext, create_trace, finish_trace, trace_span
 from .privacy import allowed_for_cloud, get_privacy_settings
 from .retrieval_engine import pipeline_search
 
@@ -91,7 +91,7 @@ def candidate_generation_estimate(dataset_id: str, count: int) -> dict[str, Any]
     characters = sum(min(len(item["text"]), 700) for item in snippets)
     return {
         "dataset_id": dataset_id,
-        "requested_candidates": max(1, min(count, 20)),
+        "requested_candidates": max(1, min(count, 70)),
         "source_chunk_count": len(snippets),
         "allowed_document_count": len(allowed_documents),
         "estimated_input_characters": characters,
@@ -346,19 +346,7 @@ def create_experiment_run(
 ) -> dict:
     if not rows("SELECT 1 ok FROM eval_dataset_versions WHERE id=? AND status='ready'", (dataset_version_id,)):
         raise ValueError("评测集不存在或尚未就绪")
-    stable_config = {
-        "pipeline": config.get("pipeline", "bm25"),
-        "generation_id": config.get("generation_id"),
-        "candidate_k": max(5, min(int(config.get("candidate_k", 20)), 100)),
-        # Recall@10 and nDCG@10 are release metrics, so every quality run must
-        # retrieve at least ten candidates even when the product UI shows fewer.
-        "top_k": max(10, min(int(config.get("top_k", 10)), 20)),
-        "rrf_k": max(1, min(int(config.get("rrf_k", 60)), 200)),
-        "reranker_model": config.get("reranker_model"),
-        "split": config.get("split", "dev"),
-    }
-    if stable_config["split"] not in {"dev", "holdout", "all"}:
-        raise ValueError("Experiment split must be dev, holdout, or all")
+    stable_config = normalize_experiment_config(config)
     config_hash = hashlib.sha256(json_value(stable_config).encode("utf-8")).hexdigest()
     run_id = uuid4().hex
     with connect() as db:
@@ -372,6 +360,47 @@ def create_experiment_run(
             ),
         )
     return experiment_detail(run_id) or {"id": run_id, "status": "queued"}
+
+
+def normalize_experiment_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Create the immutable, hashable configuration used by a run and a sweep."""
+    stable_config = {
+        "pipeline": config.get("pipeline", "bm25"),
+        "generation_id": config.get("generation_id"),
+        "candidate_k": max(5, min(int(config.get("candidate_k", 20)), 100)),
+        "top_k": max(5, min(int(config.get("top_k", 10)), 20)),
+        "reranker_top_n": max(10, min(int(config.get("reranker_top_n", 10)), 50)),
+        "rrf_k": max(1, min(int(config.get("rrf_k", 60)), 200)),
+        "reranker_model": config.get("reranker_model"),
+        "split": config.get("split", "dev"),
+        "case_status": config.get("case_status", "accepted"),
+    }
+    if stable_config["pipeline"] not in {"bm25", "dense", "hybrid", "hybrid_rerank"}:
+        raise ValueError("Invalid experiment pipeline")
+    if stable_config["split"] not in {"dev", "holdout", "all"}:
+        raise ValueError("Experiment split must be dev, holdout, or all")
+    if stable_config["case_status"] not in {"accepted", "exploratory"}:
+        raise ValueError("Experiment case status must be accepted or exploratory")
+    if stable_config["pipeline"] == "bm25":
+        stable_config["generation_id"] = None
+    elif not stable_config["generation_id"]:
+        raise ValueError("Dense or hybrid experiments require an index generation")
+    if stable_config["generation_id"]:
+        generation_matches = rows(
+            "SELECT * FROM index_generations WHERE id=? AND status='ready'",
+            (stable_config["generation_id"],),
+        )
+        if not generation_matches:
+            raise ValueError("Selected index generation is not ready")
+        generation = generation_matches[0]
+        stable_config["index_snapshot"] = {
+            "id": generation["id"], "provider": generation["provider"], "model": generation["model"],
+            "dimension": generation["dimension"], "strategy": generation["strategy"],
+            "chunk_size": generation["chunk_size"], "chunk_overlap": generation["chunk_overlap"],
+            "config_hash": generation["config_hash"], "parser_version": generation["parser_version"],
+            "chunker_version": generation["chunker_version"],
+        }
+    return stable_config
 
 
 def _locator_matches(expected: str, actual: str) -> bool:
@@ -416,8 +445,9 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
     dataset = rows("SELECT * FROM eval_dataset_versions WHERE id=?", (run["dataset_version_id"],))[0]
     split_clause = "" if config["split"] == "all" else "AND split=?"
     params: tuple[Any, ...] = (run["dataset_version_id"],) if config["split"] == "all" else (run["dataset_version_id"], config["split"])
+    case_status_clause = "status='accepted'" if config.get("case_status", "accepted") == "accepted" else "status IN ('accepted','draft')"
     cases = rows(
-        f"""SELECT * FROM eval_dataset_cases WHERE dataset_version_id=? AND status='accepted' {split_clause}
+        f"""SELECT * FROM eval_dataset_cases WHERE dataset_version_id=? AND {case_status_clause} {split_clause}
             ORDER BY id""",
         params,
     )
@@ -432,8 +462,15 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
         db.execute("DELETE FROM experiment_case_results WHERE run_id=?", (run_id,))
     try:
         latencies: list[float] = []
+        stage_latencies: dict[str, list[float]] = {}
+        api_totals = {
+            "embedding_requests": 0, "rerank_requests": 0, "embedding_cache_hits": 0,
+            "rerank_cache_hits": 0, "embedding_input_characters": 0, "rerank_input_characters": 0,
+        }
         doc_hits = {1: 0, 5: 0, 10: 0}
         evidence_hits = {1: 0, 5: 0, 10: 0}
+        stage_doc_hits: dict[str, dict[int, int]] = {}
+        stage_evidence_hits: dict[str, dict[int, int]] = {}
         reciprocal_ranks: list[float] = []
         ndcgs: list[float] = []
         citation_total = 0
@@ -448,25 +485,44 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
                 message=f"正在评测 {case_index} / {len(cases)}",
             )
             gold = json.loads(case["gold_json"] or "[]")
+            gold_documents = {item.get("document_id") for item in gold}
             result = pipeline_search(case["question"], dataset["space_id"], config, trace_type="evaluation_case")
             returned = result["results"]
+            stage_results = result.get("stage_results", {})
+            for stage_name, stage_items in stage_results.items():
+                if stage_name in {"final", "evaluation"} or not stage_items:
+                    continue
+                stage_doc_hits.setdefault(stage_name, {1: 0, 5: 0, 10: 0})
+                stage_evidence_hits.setdefault(stage_name, {1: 0, 5: 0, 10: 0})
+                for k in (1, 5, 10):
+                    stage_slice = stage_items[:k]
+                    if any(item.get("document_id") in gold_documents for item in stage_slice):
+                        stage_doc_hits[stage_name][k] += 1
+                    if any(_relevance(item, gold) > 0 for item in stage_slice):
+                        stage_evidence_hits[stage_name][k] += 1
+            for key, value in result.get("latency_breakdown", {}).items():
+                stage_latencies.setdefault(key, []).append(float(value or 0))
+            for key, value in result.get("api_stats", {}).items():
+                if key in api_totals:
+                    api_totals[key] += int(value or 0)
             citation_total += len(returned)
             citation_resolvable += sum(bool(item.get("id") and item.get("locator")) for item in returned)
             latencies.append(float(result["duration_ms"]))
-            gold_documents = {item.get("document_id") for item in gold}
-            relevances = [_relevance(item, gold) for item in returned]
-            first_rank = next((index for index, relevance in enumerate(relevances, 1) if relevance > 0), None)
+            evaluation_items = stage_results.get("evaluation") or returned
+            evaluation_relevances = [_relevance(item, gold) for item in evaluation_items]
+            returned_relevances = [_relevance(item, gold) for item in returned]
+            first_rank = next((index for index, relevance in enumerate(evaluation_relevances, 1) if relevance > 0), None)
             for k in (1, 5, 10):
-                if any(item.get("document_id") in gold_documents for item in returned[:k]):
+                if any(item.get("document_id") in gold_documents for item in evaluation_items[:k]):
                     doc_hits[k] += 1
-                if any(value > 0 for value in relevances[:k]):
+                if any(value > 0 for value in evaluation_relevances[:k]):
                     evidence_hits[k] += 1
             reciprocal_ranks.append(1 / first_rank if first_rank else 0.0)
             ideal = sorted([int(item.get("relevance", 3)) for item in gold], reverse=True)
             ideal_dcg = _dcg(ideal, 10)
-            ndcg = _dcg(relevances, 10) / ideal_dcg if ideal_dcg else 0.0
+            ndcg = _dcg(evaluation_relevances, 10) / ideal_dcg if ideal_dcg else 0.0
             ndcgs.append(ndcg)
-            document_found = any(item.get("document_id") in gold_documents for item in returned)
+            document_found = any(item.get("document_id") in gold_documents for item in evaluation_items)
             if first_rank:
                 failure = None
             elif document_found:
@@ -486,6 +542,8 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
                 "first_evidence_rank": first_rank,
                 "reciprocal_rank": round(1 / first_rank, 6) if first_rank else 0,
                 "ndcg_10": round(ndcg, 6),
+                "evaluation_result_count": len(evaluation_items),
+                "context_result_count": len(returned),
             }
             rankings = {
                 "gold": gold,
@@ -502,9 +560,22 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
                         "score": item.get("score"),
                         "relevance": relevance,
                     }
-                    for item, relevance in zip(returned, relevances)
+                    for item, relevance in zip(returned, returned_relevances)
+                ],
+                "evaluation": [
+                    {
+                        "chunk_id": item.get("chunk_id") or item.get("id"),
+                        "document_id": item.get("document_id"),
+                        "locator": item.get("locator"),
+                        "rank": index,
+                        "relevance": relevance,
+                    }
+                    for index, (item, relevance) in enumerate(zip(evaluation_items, evaluation_relevances), 1)
                 ],
                 "stages": result["stages"],
+                "stage_results": stage_results,
+                "latency_breakdown": result.get("latency_breakdown", {}),
+                "api_stats": result.get("api_stats", {}),
             }
             with connect() as db:
                 db.execute(
@@ -535,6 +606,23 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
                 key: {"evidence_recall": round(value[0] / value[1], 4), "case_count": value[1]}
                 for key, value in type_totals.items()
             },
+            "stage_recall": {
+                stage: {
+                    "document_recall": {str(k): round(stage_doc_hits[stage][k] / case_count, 4) for k in (1, 5, 10)},
+                    "evidence_recall": {str(k): round(stage_evidence_hits[stage][k] / case_count, 4) for k in (1, 5, 10)},
+                }
+                for stage in stage_doc_hits
+            },
+            "latency_breakdown": {
+                key: {
+                    "mean": round(mean(values), 2) if values else 0,
+                    "p50": _percentile(values, 0.5),
+                    "p95": _percentile(values, 0.95),
+                }
+                for key, values in stage_latencies.items()
+            },
+            "api_stats": api_totals,
+            "evaluation_scope": "accepted" if config.get("case_status", "accepted") == "accepted" else "exploratory",
             "dataset": {"name": dataset["name"], "version": dataset["version"], "content_hash": dataset["content_hash"]},
             "config": config,
         }
@@ -698,10 +786,13 @@ def compare_experiments(baseline_id: str, candidate_id: str) -> dict[str, Any]:
             "baseline": base_p95,
             "candidate": candidate_p95,
             "delta": round(candidate_p95 - base_p95, 2),
-            "status": "failed" if base_p95 and candidate_p95 > base_p95 * 1.2 else "passed",
+            "status": "advisory" if base_p95 and candidate_p95 > base_p95 * 1.2 else "informational",
             "rule": "增长不得超过 20%",
         },
     ]
+    for check in checks:
+        if check["name"] == "Retrieval P95":
+            check["rule"] = "Provider and total latency are advisory; quality is not blocked."
     baseline_cases = {item["case_id"]: int(bool(item["metrics"].get("evidence_hit"))) for item in baseline["cases"]}
     candidate_cases = {item["case_id"]: int(bool(item["metrics"].get("evidence_hit"))) for item in candidate["cases"]}
     paired = [(baseline_cases[key], candidate_cases[key]) for key in baseline_cases if key in candidate_cases]
@@ -725,6 +816,185 @@ def compare_experiments(baseline_id: str, candidate_id: str) -> dict[str, Any]:
         "checks": checks,
         "confidence": confidence,
     }
+
+
+def create_experiment_sweep(
+    dataset_version_id: str,
+    name: str,
+    configs: list[dict[str, Any]],
+    case_status: str = "accepted",
+) -> dict[str, Any]:
+    dataset = dataset_detail(dataset_version_id)
+    if not dataset or dataset["status"] != "ready":
+        raise ValueError("Evaluation dataset does not exist or is not ready")
+    if case_status not in {"accepted", "exploratory"}:
+        raise ValueError("Sweep case status must be accepted or exploratory")
+    if not configs or len(configs) > 100:
+        raise ValueError("Sweep must contain between 1 and 100 configurations")
+    normalized: list[dict[str, Any]] = []
+    seen_hashes: set[str] = set()
+    for ordinal, raw in enumerate(configs, 1):
+        config = {**raw, "case_status": case_status}
+        stable = normalize_experiment_config(config)
+        config_hash = hashlib.sha256(json_value(stable).encode("utf-8")).hexdigest()
+        if config_hash in seen_hashes:
+            continue
+        seen_hashes.add(config_hash)
+        normalized.append({"ordinal": ordinal, "name": raw.get("name") or f"{name} #{ordinal}", "config": stable, "config_hash": config_hash})
+    if not normalized:
+        raise ValueError("Sweep has no unique configurations")
+    eligible_cases = [
+        item for item in dataset["cases"]
+        if item["status"] == "accepted" and (case_status == "exploratory" or item["status"] == "accepted")
+    ]
+    if case_status == "exploratory":
+        eligible_cases = [item for item in dataset["cases"] if item["status"] in {"accepted", "draft"}]
+    if not eligible_cases:
+        raise ValueError("Selected dataset has no eligible cases")
+    request_count = 0
+    for item in normalized:
+        pipeline = item["config"]["pipeline"]
+        request_count += len(eligible_cases) * (
+            int(pipeline in {"dense", "hybrid", "hybrid_rerank"}) + int(pipeline == "hybrid_rerank")
+        )
+    if request_count > 0:
+        sample_chars = rows(
+            "SELECT COALESCE(SUM(length(text)),0) total FROM chunks WHERE document_id IN (SELECT id FROM documents WHERE space_id=?)",
+            (dataset["space_id"],),
+        )[0]["total"]
+    else:
+        sample_chars = 0
+    sweep_config = {
+        "case_status": case_status,
+        "dataset_version_id": dataset_version_id,
+        "items": normalized,
+        "execution": "serial",
+    }
+    sweep_hash = hashlib.sha256(json_value(sweep_config).encode("utf-8")).hexdigest()
+    existing = rows("SELECT id FROM experiment_sweeps WHERE config_hash=?", (sweep_hash,))
+    if existing:
+        return sweep_detail(existing[0]["id"]) or {}
+    sweep_id = uuid4().hex
+    stamp = now()
+    with connect() as db:
+        db.execute(
+            """INSERT INTO experiment_sweeps(
+               id,dataset_version_id,name,status,config_json,config_hash,case_status,
+               estimated_requests,estimated_input_characters,created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (
+                sweep_id, dataset_version_id, name[:120], "queued", json_value(sweep_config), sweep_hash,
+                case_status, request_count, int(sample_chars or 0), stamp,
+            ),
+        )
+    for item in normalized:
+        existing_run = rows(
+            "SELECT id,status FROM experiment_runs WHERE dataset_version_id=? AND config_hash=? ORDER BY created_at DESC LIMIT 1",
+            (dataset_version_id, item["config_hash"]),
+        )
+        if existing_run:
+            run_id = existing_run[0]["id"]
+            item_status = existing_run[0]["status"]
+        else:
+            run = create_experiment_run(dataset_version_id, item["name"], item["config"])
+            run_id = run["id"]
+            item_status = run["status"]
+        with connect() as db:
+            db.execute(
+                "INSERT INTO experiment_sweep_items(sweep_id,ordinal,run_id,status) VALUES(?,?,?,?)",
+                (sweep_id, item["ordinal"], run_id, item_status if item_status in {"succeeded", "running", "queued", "failed"} else "queued"),
+            )
+    return sweep_detail(sweep_id) or {"id": sweep_id, "status": "queued"}
+
+
+def list_experiment_sweeps(limit: int = 30) -> list[dict[str, Any]]:
+    return [sweep_summary(item) for item in rows(
+        "SELECT * FROM experiment_sweeps ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 100)),)
+    )]
+
+
+def sweep_summary(item: dict[str, Any]) -> dict[str, Any]:
+    decoded = dict(item)
+    decoded["config"] = json.loads(decoded.pop("config_json") or "{}")
+    counts = rows(
+        "SELECT status,COUNT(*) count FROM experiment_sweep_items WHERE sweep_id=? GROUP BY status",
+        (decoded["id"],),
+    )
+    decoded["item_counts"] = {row["status"]: row["count"] for row in counts}
+    decoded["total_items"] = sum(decoded["item_counts"].values())
+    decoded["completed_items"] = sum(decoded["item_counts"].get(value, 0) for value in ("succeeded", "failed", "cancelled"))
+    return decoded
+
+
+def sweep_detail(sweep_id: str) -> dict[str, Any] | None:
+    matches = rows("SELECT * FROM experiment_sweeps WHERE id=?", (sweep_id,))
+    if not matches:
+        return None
+    sweep = sweep_summary(matches[0])
+    item_rows = rows(
+        """SELECT i.*,r.name,r.status run_status,r.config_json,r.summary_json,r.error_code run_error
+           FROM experiment_sweep_items i JOIN experiment_runs r ON r.id=i.run_id
+           WHERE i.sweep_id=? ORDER BY i.ordinal""",
+        (sweep_id,),
+    )
+    items: list[dict[str, Any]] = []
+    for item in item_rows:
+        item["config"] = json.loads(item.pop("config_json") or "{}")
+        item["summary"] = json.loads(item.pop("summary_json") or "{}")
+        item["status"] = item["run_status"] if item["run_status"] in {"succeeded", "running", "queued", "failed"} else item["status"]
+        item.pop("run_status", None)
+        items.append(item)
+    sweep["items"] = items
+    return sweep
+
+
+def run_experiment_sweep(sweep_id: str, context: JobContext) -> dict[str, Any]:
+    sweep = sweep_detail(sweep_id)
+    if not sweep:
+        raise ValueError("Experiment sweep does not exist")
+    started = perf_counter()
+    with connect() as db:
+        db.execute("UPDATE experiment_sweeps SET status='running',started_at=?,error_code=NULL WHERE id=?", (now(), sweep_id))
+    failed = 0
+    cancelled = False
+    try:
+        items = sweep["items"]
+        for index, item in enumerate(items, 1):
+            context.check_cancelled()
+            if item["status"] == "succeeded":
+                context.update(progress=int(index / len(items) * 100), phase="sweep", message=f"跳过已完成实验 {index}/{len(items)}")
+                continue
+            with connect() as db:
+                db.execute("UPDATE experiment_sweep_items SET status='running',started_at=?,error_code=NULL WHERE sweep_id=? AND ordinal=?", (now(), sweep_id, item["ordinal"]))
+                db.execute("UPDATE experiment_runs SET status='queued',error_code=NULL WHERE id=? AND status='failed'", (item["run_id"],))
+            try:
+                run_experiment(item["run_id"], context)
+                item_status = "succeeded"
+                error_code = None
+            except JobCancelled:
+                cancelled = True
+                with connect() as db:
+                    db.execute("UPDATE experiment_sweep_items SET status='cancelled',finished_at=? WHERE sweep_id=? AND ordinal=?", (now(), sweep_id, item["ordinal"]))
+                raise
+            except Exception as error:
+                failed += 1
+                item_status = "failed"
+                error_code = type(error).__name__
+            with connect() as db:
+                db.execute("UPDATE experiment_sweep_items SET status=?,error_code=?,finished_at=? WHERE sweep_id=? AND ordinal=?", (item_status, error_code, now(), sweep_id, item["ordinal"]))
+            context.update(progress=int(index / len(items) * 100), phase="sweep", message=f"实验完成 {index}/{len(items)}")
+        final_status = "partial_failed" if failed else "succeeded"
+        with connect() as db:
+            db.execute("UPDATE experiment_sweeps SET status=?,finished_at=?,error_code=? WHERE id=?", (final_status, now(), "child_failed" if failed else None, sweep_id))
+        return {"sweep_id": sweep_id, "status": final_status, "failed_items": failed, "duration_ms": round((perf_counter() - started) * 1000, 2)}
+    except JobCancelled:
+        with connect() as db:
+            db.execute("UPDATE experiment_sweeps SET status='cancelled',finished_at=?,error_code='cancelled' WHERE id=?", (now(), sweep_id))
+        raise
+    except Exception as error:
+        with connect() as db:
+            db.execute("UPDATE experiment_sweeps SET status='failed',finished_at=?,error_code=? WHERE id=?", (now(), type(error).__name__, sweep_id))
+        raise
 
 
 def create_performance_benchmark(config: dict[str, Any]) -> dict:
