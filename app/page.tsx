@@ -182,8 +182,9 @@ type EvalDataset = {
   cases?: Array<{ id: string; question: string; status: string; split: string; query_type: string; difficulty: string; gold: Array<{ title: string; locator: string; relevance: number }> }>;
 };
 type Experiment = {
-  id: string; name: string; status: string; dataset_version_id: string; created_at: string; config: Record<string, unknown>;
-  summary: { case_count?: number; document_recall?: Record<string, number>; evidence_recall?: Record<string, number>; mrr?: number; ndcg_10?: number; citation_resolvable_rate?: number; latency_ms?: Record<string, number>; failure_counts?: Record<string, number>; query_types?: Record<string, { evidence_recall: number; case_count: number }> };
+  id: string; name: string; status: string; dataset_version_id: string; created_at: string; finished_at?: string | null; config: Record<string, unknown>;
+  config_hash?: string; git_revision?: string; machine?: Record<string, unknown>;
+  summary: { case_count?: number; document_recall?: Record<string, number>; evidence_recall?: Record<string, number>; mrr?: number; ndcg_10?: number; citation_resolvable_rate?: number; latency_ms?: Record<string, number>; failure_counts?: Record<string, number>; query_types?: Record<string, { evidence_recall: number; case_count: number }>; dataset?: { name?: string; version?: string; content_hash?: string } };
   cases?: Array<{ case_id: string; question: string; failure_category?: string | null; latency_ms: number; metrics: Record<string, unknown>; rankings: { returned?: Array<Record<string, unknown>> } }>;
 };
 type InfraOverview = {
@@ -230,6 +231,28 @@ function formatSize(bytes: number) {
 function formatDate(value: string) {
   if (!value) return "—";
   return new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value));
+}
+
+function experimentQualityScore(item: Experiment) {
+  const summary = item.summary || {};
+  return (summary.evidence_recall?.["5"] || 0) * 0.5 + (summary.mrr || 0) * 0.3 + (summary.ndcg_10 || 0) * 0.2;
+}
+
+function experimentPipelineLabel(item: Experiment) {
+  const pipeline = String(item.config?.pipeline || "bm25");
+  return ({ bm25: "BM25", dense: "Dense", hybrid: "Hybrid + RRF", hybrid_rerank: "Hybrid + Rerank" } as Record<string, string>)[pipeline] || pipeline;
+}
+
+function metricPercent(value?: number) {
+  return typeof value === "number" ? `${(value * 100).toFixed(1)}%` : "—";
+}
+
+function metricNumber(value?: number, digits = 3) {
+  return typeof value === "number" ? value.toFixed(digits) : "—";
+}
+
+function metricMillis(value?: number) {
+  return typeof value === "number" ? `${Math.round(value)} ms` : "—";
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -1294,6 +1317,79 @@ function ImageSearchView({ activeSpace, openFiles }: { activeSpace?: Space; open
   </div>;
 }
 
+type ExperimentHistoryProps = {
+  experiments: Experiment[];
+  leaderboardExperiments: Experiment[];
+  compareExperiments: Experiment[];
+  compareExperimentIds: string[];
+  experimentView: "leaderboard" | "compare";
+  onViewChange: (view: "leaderboard" | "compare") => void;
+  onToggleCompare: (id: string) => void;
+  onOpenExperiment: (id: string) => void;
+  indexes: IndexGeneration[];
+};
+
+function ExperimentHistory({
+  experiments, leaderboardExperiments, compareExperiments, compareExperimentIds, experimentView,
+  onViewChange, onToggleCompare, onOpenExperiment, indexes,
+}: ExperimentHistoryProps) {
+  const maxLatency = Math.max(1, ...compareExperiments.map((item) => Number(item.summary.latency_ms?.p95 || 0)));
+  const metrics: Array<{ label: string; max: number; value: (item: Experiment) => number | undefined; format: (value?: number) => string }> = [
+    { label: "Document Recall@5", max: 1, value: (item) => item.summary.document_recall?.["5"], format: metricPercent },
+    { label: "Evidence Recall@1", max: 1, value: (item) => item.summary.evidence_recall?.["1"], format: metricPercent },
+    { label: "Evidence Recall@5", max: 1, value: (item) => item.summary.evidence_recall?.["5"], format: metricPercent },
+    { label: "Evidence Recall@10", max: 1, value: (item) => item.summary.evidence_recall?.["10"], format: metricPercent },
+    { label: "MRR", max: 1, value: (item) => item.summary.mrr, format: metricNumber },
+    { label: "nDCG@10", max: 1, value: (item) => item.summary.ndcg_10, format: metricNumber },
+    { label: "Citation resolvable", max: 1, value: (item) => item.summary.citation_resolvable_rate, format: metricPercent },
+    { label: "P50 latency", max: maxLatency, value: (item) => item.summary.latency_ms?.p50, format: metricMillis },
+    { label: "P95 latency", max: maxLatency, value: (item) => item.summary.latency_ms?.p95, format: metricMillis },
+    { label: "P99 latency", max: maxLatency, value: (item) => item.summary.latency_ms?.p99, format: metricMillis },
+  ];
+  const baseline = compareExperiments[0];
+  return <section className="infra-panel experiment-history">
+    <header className="experiment-history-header">
+      <div><span>RUN HISTORY / LEADERBOARD</span><h2>实验运行榜单与对比矩阵</h2><p className="experiment-history-caption">每次运行都保存为独立快照；质量、延迟、配置和 Bad Case 可回看，不会覆盖之前的结果。</p></div>
+      <div className="experiment-history-actions">
+        <button className={experimentView === "leaderboard" ? "selected" : ""} onClick={() => onViewChange("leaderboard")}>排行榜</button>
+        <button className={experimentView === "compare" ? "selected" : ""} onClick={() => onViewChange("compare")}>对比矩阵 {compareExperiments.length ? `(${compareExperiments.length})` : ""}</button>
+        <button className="primary-button" disabled={compareExperiments.length < 2} onClick={() => onViewChange("compare")}>可视化对比</button>
+      </div>
+    </header>
+    <div className="experiment-history-summary">
+      <div><span>已保存运行</span><strong>{experiments.length}</strong><small>包含成功、失败和排队记录</small></div>
+      <div><span>可用于排行</span><strong>{leaderboardExperiments.length}</strong><small>已完成且有 Gold 指标</small></div>
+      <div><span>当前选择</span><strong>{compareExperiments.length} / 3</strong><small>选择后点击“可视化对比”</small></div>
+      <div><span>排序口径</span><strong>0.5 / 0.3 / 0.2</strong><small>Evidence R@5 · MRR · nDCG@10</small></div>
+    </div>
+    {experimentView === "leaderboard" ? <div className="table-responsive experiment-history-table-wrap"><div className="experiment-history-table">
+      <div className="experiment-history-head"><span>选择</span><span>排名</span><span>运行 / 配置</span><span>Pipeline</span><span>Evidence R@5</span><span>MRR</span><span>nDCG@10</span><span>P95</span><span>状态</span><span>操作</span></div>
+      {leaderboardExperiments.map((item, index) => {
+        const generation = indexes.find((entry) => entry.id === String(item.config?.generation_id || ""));
+        const model = generation?.model || String(item.config?.embedding_model || (item.config?.pipeline === "bm25" ? "本地 BM25" : "向量索引"));
+        return <div className={`experiment-history-row ${compareExperimentIds.includes(item.id) ? "selected" : ""}`} key={item.id}>
+          <label className="experiment-check"><input type="checkbox" checked={compareExperimentIds.includes(item.id)} onChange={() => onToggleCompare(item.id)} /><span className="sr-only">选择 {item.name}</span></label>
+          <strong className="experiment-rank">#{index + 1}</strong>
+          <span className="experiment-run-name"><b>{item.name}</b><small>{formatDate(item.created_at)} · {model}{generation ? ` · ${generation.dimension}d` : ""}</small></span>
+          <span>{experimentPipelineLabel(item)}</span>
+          <strong>{metricPercent(item.summary.evidence_recall?.["5"])}</strong>
+          <strong>{metricNumber(item.summary.mrr)}</strong>
+          <strong>{metricNumber(item.summary.ndcg_10)}</strong>
+          <span>{metricMillis(item.summary.latency_ms?.p95)}</span>
+          <span className={`infra-status ${item.status}`}>{item.status}</span>
+          <button className="link-button" onClick={() => onOpenExperiment(item.id)}>查看</button>
+        </div>;
+      })}
+      {!leaderboardExperiments.length && <p className="infra-empty">还没有成功的 Gold 评测运行。完成一次实验后，这里会自动形成可复现榜单。</p>}
+    </div></div> : compareExperiments.length < 2 ? <div className="experiment-compare-empty"><strong>先在排行榜勾选至少 2 次运行</strong><p>建议选择同一数据集、只改变一个变量的运行，例如 1024d 与 256d，或 Hybrid 与 Hybrid + Rerank。</p><button onClick={() => onViewChange("leaderboard")}>返回排行榜选择</button></div> : <div className="experiment-comparison">
+      <div className="experiment-compare-context"><span>对比基线</span><strong>{baseline?.name}</strong><small>左侧第一项作为基线，其余运行显示相对差值。</small></div>
+      <div className="experiment-compare-cards">{compareExperiments.map((item, index) => <article key={item.id} className={index === 0 ? "baseline" : ""}><span>{index === 0 ? "BASELINE" : `CANDIDATE ${index}`}</span><strong>{item.name}</strong><small>{experimentPipelineLabel(item)} · {String(item.config?.split || "all")} · {item.summary.case_count || 0} cases</small><small>config {String(item.config_hash || "—").slice(0, 10)} · git {String(item.git_revision || "—").slice(0, 10)}</small><a href={`${API_BASE}/api/eval/experiments/${item.id}/report?format=markdown`} target="_blank" rel="noreferrer">打开完整报告 ↗</a></article>)}</div>
+      <div className="experiment-metric-matrix" role="table" aria-label="实验指标对比矩阵"><div className="experiment-matrix-head"><strong>指标</strong>{compareExperiments.map((item) => <span key={item.id}>{item.name}</span>)}</div>{metrics.map((metric) => <div className="experiment-matrix-row" key={metric.label}><strong>{metric.label}</strong>{compareExperiments.map((item) => { const value = metric.value(item); const numeric = typeof value === "number" ? value : 0; const width = Math.max(0, Math.min(100, numeric / metric.max * 100)); return <span key={item.id}><b>{metric.format(value)}</b><i><em style={{ width: `${width}%` }} /></i></span>; })}</div>)}</div>
+      <div className="experiment-delta-list">{baseline && compareExperiments.slice(1).map((item) => { const qualityDelta = (item.summary.evidence_recall?.["5"] || 0) - (baseline.summary.evidence_recall?.["5"] || 0); const latencyDelta = (item.summary.latency_ms?.p95 || 0) - (baseline.summary.latency_ms?.p95 || 0); return <article key={item.id}><span><b>{item.name}</b><small>相对 {baseline.name}</small></span><strong className={qualityDelta >= 0 ? "positive" : "negative"}>Evidence R@5 {qualityDelta >= 0 ? "+" : ""}{(qualityDelta * 100).toFixed(1)} pp</strong><strong className={latencyDelta <= 0 ? "positive" : "negative"}>P95 {latencyDelta >= 0 ? "+" : ""}{Math.round(latencyDelta)} ms</strong></article>; })}</div>
+    </div>}
+  </section>;
+}
+
 function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Health | null }) {
   const [tab, setTab] = useState<"cockpit" | "traces" | "experiments" | "duel" | "gate">("cockpit");
   const [overview, setOverview] = useState<InfraOverview | null>(null);
@@ -1308,6 +1404,8 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
   const [selectedTrace, setSelectedTrace] = useState<InfraTrace | null>(null);
   const [selectedDataset, setSelectedDataset] = useState<EvalDataset | null>(null);
   const [selectedExperiment, setSelectedExperiment] = useState<Experiment | null>(null);
+  const [experimentView, setExperimentView] = useState<"leaderboard" | "compare">("leaderboard");
+  const [compareExperimentIds, setCompareExperimentIds] = useState<string[]>([]);
   const [plannedIndex, setPlannedIndex] = useState<IndexGeneration | null>(null);
   const [duel, setDuel] = useState<DuelResult | null>(null);
   const [regression, setRegression] = useState<RegressionResult | null>(null);
@@ -1328,6 +1426,11 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
   const spaceId = activeSpace?.id || "ai-agent-learning";
   const readyIndexes = indexes.filter((item) => item.status === "ready");
   const successfulExperiments = experiments.filter((item) => item.status === "succeeded");
+  const leaderboardExperiments = useMemo(
+    () => [...successfulExperiments].sort((left, right) => experimentQualityScore(right) - experimentQualityScore(left)),
+    [successfulExperiments],
+  );
+  const compareExperiments = compareExperimentIds.map((id) => experiments.find((item) => item.id === id)).filter(Boolean) as Experiment[];
   const selectedIndexId = experimentIndex || readyIndexes[0]?.id || "";
 
   async function loadInfra() {
@@ -1465,6 +1568,17 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
     await runAction(`experiment-${id}`, async () => setSelectedExperiment(await api<Experiment>(`/api/eval/experiments/${id}`)));
   }
 
+  function toggleExperimentForCompare(id: string) {
+    setCompareExperimentIds((current) => {
+      if (current.includes(id)) return current.filter((item) => item !== id);
+      if (current.length >= 3) {
+        setNotice("对比视图最多选择 3 次成功运行。");
+        return current;
+      }
+      return [...current, id];
+    });
+  }
+
   async function runDuel() {
     if (!duelQuestion.trim()) return;
     await runAction("duel", async () => setDuel(await api<DuelResult>("/api/infra/retrieval-duel", {
@@ -1526,7 +1640,7 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
       <div className="quality-separation"><div><b>QUALITY TRACK</b><strong>人工 Gold · 真实文档</strong><p>用于 Recall、MRR、nDCG、Bad Case；候选题未经确认不计分。</p></div><i>≠</i><div><b>PERFORMANCE TRACK</b><strong>确定性生成向量</strong><p>只用于延迟、QPS、内存和 ANN Recall，不宣称检索准确率。</p></div></div>
       <div className="infra-two-columns experiment-top"><section className="infra-panel"><header><div><span>DATASET VERSIONING</span><h2>Gold 数据集</h2></div><div><button onClick={() => void importLegacyDataset()}>导入现有题</button><button onClick={() => void createCandidateDataset()}>新建</button></div></header><div className="dataset-list">{datasets.map((item) => <button key={item.id} className={selectedDataset?.id === item.id ? "selected" : ""} onClick={() => void openDataset(item.id)}><span><strong>{item.name} <i>{item.version}</i></strong><small>{item.accepted_count || 0} accepted · {item.draft_count || 0} draft</small></span><b>{item.status}</b></button>)}{!datasets.length && <p className="infra-empty">可先导入已有 30 条题，或创建 100 条 Gold 工作集。</p>}</div></section><section className="infra-panel"><header><div><span>EXPERIMENT CONFIG</span><h2>一次只改变一个变量</h2></div><b>REPRODUCIBLE</b></header><div className="experiment-controls"><label>Pipeline<select value={experimentPipeline} onChange={(event) => setExperimentPipeline(event.target.value)}><option value="bm25">BM25</option><option value="dense">Dense</option><option value="hybrid">BM25 + Dense + RRF</option><option value="hybrid_rerank">Hybrid + qwen3-rerank</option></select></label><label>索引代次<select value={selectedIndexId} onChange={(event) => setExperimentIndex(event.target.value)}><option value="">BM25 不使用向量索引</option>{readyIndexes.map((item) => <option value={item.id} key={item.id}>{item.model} · {item.dimension}d · {item.chunk_size}/{item.chunk_overlap}</option>)}</select></label><button className="primary-button" disabled={Boolean(busy) || !datasets.length} onClick={() => void startExperiment()}>{busy === "experiment" ? "入队中…" : "运行质量实验"}</button></div><p className="experiment-rule">每次保存 Dataset hash、配置 hash、Git revision、机器信息和逐题排名。Recall@10 强制检索至少 10 条结果。</p></section></div>
       {selectedDataset && <section className="infra-panel gold-workbench"><header><div><span>HUMAN REVIEW</span><h2>{selectedDataset.name} · 人工 Gold 工作台</h2></div><div><b>{selectedDataset.cases?.filter((item) => item.status === "accepted").length || 0} / 100</b><button disabled={Boolean(busy)} onClick={() => void generateCandidates()}>＋ 生成 10 条 draft</button></div></header><div>{(selectedDataset.cases || []).slice(0, 20).map((item, index) => <article key={item.id}><i>{String(index + 1).padStart(2, "0")}</i><span><strong>{item.question}</strong><small>{item.query_type} · {item.difficulty} · {item.gold?.[0]?.title} {item.gold?.[0]?.locator}</small></span><b className={`case-${item.status}`}>{item.status}</b>{item.status === "draft" && <aside><button onClick={() => void reviewCase(item.id, "rejected")}>拒绝</button><button onClick={() => void reviewCase(item.id, "accepted")}>确认 Gold</button></aside>}</article>)}</div></section>}
-      <section className="infra-panel experiment-results"><header><div><span>EXPERIMENT RUNS</span><h2>指标与 Bad Case</h2></div><b>{successfulExperiments.length} COMPLETED</b></header><div className="experiment-table"><div className="experiment-head"><span>Run</span><span>Pipeline</span><span>Evidence R@5</span><span>MRR</span><span>P95</span><span>Status</span></div>{experiments.slice(0, 12).map((item) => <button key={item.id} onClick={() => void openExperiment(item.id)}><span><strong>{item.name}</strong><small>{formatDate(item.created_at)}</small></span><span>{String(item.config.pipeline || "—")}</span><span>{item.summary.evidence_recall ? `${Math.round((item.summary.evidence_recall["5"] || 0) * 100)}%` : "—"}</span><span>{item.summary.mrr ?? "—"}</span><span>{item.summary.latency_ms?.p95 ? `${item.summary.latency_ms.p95} ms` : "—"}</span><span className={`infra-status ${item.status}`}>{item.status}</span></button>)}</div></section>
+      <ExperimentHistory experiments={experiments} leaderboardExperiments={leaderboardExperiments} compareExperiments={compareExperiments} compareExperimentIds={compareExperimentIds} experimentView={experimentView} onViewChange={setExperimentView} onToggleCompare={toggleExperimentForCompare} onOpenExperiment={(id) => void openExperiment(id)} indexes={indexes} />
       {selectedExperiment && <section className="infra-panel bad-cases"><header><div><span>BAD CASE ANALYSIS</span><h2>{selectedExperiment.name}</h2></div><button onClick={() => setSelectedExperiment(null)}>关闭</button></header><div className="metric-row">{[["Document R@5", selectedExperiment.summary.document_recall?.["5"]], ["Evidence R@5", selectedExperiment.summary.evidence_recall?.["5"]], ["MRR", selectedExperiment.summary.mrr], ["nDCG@10", selectedExperiment.summary.ndcg_10], ["Citation", selectedExperiment.summary.citation_resolvable_rate]].map(([label, value]) => <div key={String(label)}><span>{label}</span><strong>{typeof value === "number" ? `${Math.round(value * 1000) / 10}%` : "—"}</strong></div>)}</div><div className="bad-case-list">{(selectedExperiment.cases || []).filter((item) => item.failure_category).map((item) => <article key={item.case_id}><b>{item.failure_category}</b><span><strong>{item.question}</strong><small>{item.latency_ms} ms · 返回 {item.rankings.returned?.length || 0} 个候选</small></span></article>)}{!(selectedExperiment.cases || []).some((item) => item.failure_category) && <p className="infra-empty">本次运行没有 Bad Case。</p>}</div></section>}
     </>}
 
