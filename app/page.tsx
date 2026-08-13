@@ -6,7 +6,7 @@ import remarkGfm from "remark-gfm";
 
 const API_BASE = "http://127.0.0.1:8765";
 
-type View = "chat" | "learning" | "spaces" | "library" | "images" | "skills" | "tools" | "memory" | "lab" | "settings";
+type View = "chat" | "learning" | "spaces" | "library" | "images" | "skills" | "tools" | "memory" | "lab" | "infra" | "settings";
 type ProviderStatus = {
   provider: string;
   label: string;
@@ -82,7 +82,7 @@ type DocumentStatus = {
   library_path: string; chunk_count: number; embedding_count: number; embedding_model?: string | null;
   updated_at: string; latest_job?: IndexJob | null;
 };
-type Health = { status: string; chat_ready: boolean; embedding_ready: boolean; chat_model: string; embedding_model: string };
+type Health = { status: string; chat_ready: boolean; embedding_ready: boolean; rerank_ready?: boolean; chat_model: string; embedding_model: string; data_dir?: string };
 type IndexJob = {
   id: string;
   status: "queued" | "running" | "completed" | "failed";
@@ -163,6 +163,52 @@ type AgentTrace = {
   exposed_tool_count: number; schema_token_estimate: number; error_type?: string | null; started_at: string; duration_ms?: number | null;
   stages: Array<{ id: string; stage_name: string; status: string; duration_ms: number; result_summary: Record<string, unknown>; error_type?: string | null }>;
 };
+type InfraJob = {
+  id: string; job_type: string; status: string; phase: string; progress: number; message: string;
+  attempt: number; max_attempts: number; error_code?: string | null; created_at: string; updated_at: string;
+};
+type InfraTrace = {
+  id: string; trace_type: string; name: string; status: string; duration_ms?: number | null; started_at: string;
+  span_count?: number; failed_span_count?: number; attributes?: Record<string, unknown>;
+  spans?: Array<{ id: string; operation: string; kind: string; status: string; duration_ms?: number | null; started_at: string; attributes: Record<string, unknown> }>;
+};
+type IndexGeneration = {
+  id: string; space_id: string; status: string; is_active: number; provider: string; model: string; dimension: number;
+  strategy: string; chunk_size: number; chunk_overlap: number; vector_count: number; index_bytes: number; created_at: string;
+  estimate?: { chunk_count: number; cache_hits: number; cache_misses: number; cache_hit_rate: number; estimated_batches: number; estimated_input_characters: number; cost_status: string; requires_confirmation: boolean };
+};
+type EvalDataset = {
+  id: string; name: string; version: string; status: string; case_count: number; accepted_count?: number; draft_count?: number; rejected_count?: number;
+  cases?: Array<{ id: string; question: string; status: string; split: string; query_type: string; difficulty: string; gold: Array<{ title: string; locator: string; relevance: number }> }>;
+};
+type Experiment = {
+  id: string; name: string; status: string; dataset_version_id: string; created_at: string; config: Record<string, unknown>;
+  summary: { case_count?: number; document_recall?: Record<string, number>; evidence_recall?: Record<string, number>; mrr?: number; ndcg_10?: number; citation_resolvable_rate?: number; latency_ms?: Record<string, number>; failure_counts?: Record<string, number>; query_types?: Record<string, { evidence_recall: number; case_count: number }> };
+  cases?: Array<{ case_id: string; question: string; failure_category?: string | null; latency_ms: number; metrics: Record<string, unknown>; rankings: { returned?: Array<Record<string, unknown>> } }>;
+};
+type InfraOverview = {
+  generated_at: string; jobs: Record<string, number>; traces: { total: number; succeeded: number; failed: number; average_ms?: number | null; p95_ms?: number | null };
+  indexes: IndexGeneration[]; recent_traces: InfraTrace[]; providers: ProviderStatus[];
+};
+type DuelResult = {
+  question: string;
+  left: { trace_id: string; duration_ms: number; stages: Array<{ stage: string; duration_ms: number; count: number }>; results: Array<Record<string, any>> };
+  right: { trace_id: string; duration_ms: number; stages: Array<{ stage: string; duration_ms: number; count: number }>; results: Array<Record<string, any>> };
+  rank_movement: Array<{ chunk_id: string; left_rank?: number; right_rank?: number; delta: number }>;
+};
+type RegressionResult = {
+  status: string; checks: Array<{ name: string; baseline: number; candidate: number; delta: number; status: string; rule: string }>;
+  confidence: { method: string; samples: number; evidence_recall_delta_95_ci: [number, number] };
+};
+type PerformanceBenchmark = {
+  id: string; status: string; created_at: string; config: Record<string, any>;
+  result: { quality_claim?: boolean; note?: string; results?: Array<Record<string, any>> };
+};
+type DocumentCloudPolicy = {
+  document_id: string; title: string; original_name: string; file_type: string;
+  embedding_allowed: number; llm_allowed: number; updated_at?: string | null;
+};
+type InfraBudget = { max_api_requests_per_run: number; max_embedding_input_characters: number; allow_multi_model_rebuild: boolean };
 
 const NAV: Array<{ id: View; icon: string; label: string }> = [
   { id: "learning", icon: "◎", label: "Agent 透视" },
@@ -173,6 +219,7 @@ const NAV: Array<{ id: View; icon: string; label: string }> = [
   { id: "tools", icon: "⌘", label: "Tools" },
   { id: "memory", icon: "◇", label: "Memory" },
   { id: "lab", icon: "⌁", label: "RAG 实验室" },
+  { id: "infra", icon: "⌬", label: "AI Infra" },
 ];
 
 function formatSize(bytes: number) {
@@ -244,6 +291,7 @@ export default function Home() {
     tools: "Tool 中心",
     memory: "Memory 中心",
     lab: "RAG 实验室",
+    infra: "AI Infra 控制台",
     settings: "设置",
   })[view], [view, activeSpace]);
 
@@ -613,6 +661,7 @@ export default function Home() {
         {view === "tools" && <ToolsView />}
         {view === "memory" && <MemoryView memories={memories} currentConversationId={currentConversationId} shortTermRevision={messages.length} updateMemory={updateMemory} createMemory={createMemory} deleteMemory={deleteMemory} />}
         {view === "lab" && <RagLabView activeSpace={activeSpace} documents={documents.filter((item) => item.space_id === activeSpace?.id)} />}
+        {view === "infra" && <InfraView activeSpace={activeSpace} health={health} />}
         {view === "settings" && <SettingsView providers={providers} health={health} testProvider={testProvider} />}
       </section>
 
@@ -1245,6 +1294,248 @@ function ImageSearchView({ activeSpace, openFiles }: { activeSpace?: Space; open
   </div>;
 }
 
+function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Health | null }) {
+  const [tab, setTab] = useState<"cockpit" | "traces" | "experiments" | "duel" | "gate">("cockpit");
+  const [overview, setOverview] = useState<InfraOverview | null>(null);
+  const [jobs, setJobs] = useState<InfraJob[]>([]);
+  const [traces, setTraces] = useState<InfraTrace[]>([]);
+  const [indexes, setIndexes] = useState<IndexGeneration[]>([]);
+  const [datasets, setDatasets] = useState<EvalDataset[]>([]);
+  const [experiments, setExperiments] = useState<Experiment[]>([]);
+  const [benchmarks, setBenchmarks] = useState<PerformanceBenchmark[]>([]);
+  const [cloudPolicies, setCloudPolicies] = useState<DocumentCloudPolicy[]>([]);
+  const [infraBudget, setInfraBudget] = useState<InfraBudget>({ max_api_requests_per_run: 500, max_embedding_input_characters: 5_000_000, allow_multi_model_rebuild: true });
+  const [selectedTrace, setSelectedTrace] = useState<InfraTrace | null>(null);
+  const [selectedDataset, setSelectedDataset] = useState<EvalDataset | null>(null);
+  const [selectedExperiment, setSelectedExperiment] = useState<Experiment | null>(null);
+  const [plannedIndex, setPlannedIndex] = useState<IndexGeneration | null>(null);
+  const [duel, setDuel] = useState<DuelResult | null>(null);
+  const [regression, setRegression] = useState<RegressionResult | null>(null);
+  const [busy, setBusy] = useState("");
+  const [notice, setNotice] = useState("");
+  const [indexModel, setIndexModel] = useState("qwen3.7-text-embedding");
+  const [indexDimension, setIndexDimension] = useState(1024);
+  const [indexStrategy, setIndexStrategy] = useState("flat");
+  const [chunkPreset, setChunkPreset] = useState("700:120");
+  const [experimentPipeline, setExperimentPipeline] = useState("bm25");
+  const [experimentIndex, setExperimentIndex] = useState("");
+  const [duelQuestion, setDuelQuestion] = useState("Agent 的记忆机制如何区分短期记忆与长期记忆？");
+  const [duelLeft, setDuelLeft] = useState("bm25");
+  const [duelRight, setDuelRight] = useState("hybrid");
+  const [baselineId, setBaselineId] = useState("");
+  const [candidateId, setCandidateId] = useState("");
+
+  const spaceId = activeSpace?.id || "ai-agent-learning";
+  const readyIndexes = indexes.filter((item) => item.status === "ready");
+  const successfulExperiments = experiments.filter((item) => item.status === "succeeded");
+  const selectedIndexId = experimentIndex || readyIndexes[0]?.id || "";
+
+  async function loadInfra() {
+    try {
+      const [overviewData, jobData, traceData, indexData, datasetData, experimentData, benchmarkData, policyData, budgetData] = await Promise.all([
+        api<InfraOverview>("/api/infra/overview"),
+        api<InfraJob[]>("/api/infra/jobs?limit=40"),
+        api<InfraTrace[]>("/api/infra/traces?limit=50"),
+        api<IndexGeneration[]>(`/api/infra/index-generations?space_id=${encodeURIComponent(spaceId)}`),
+        api<EvalDataset[]>(`/api/eval/datasets?space_id=${encodeURIComponent(spaceId)}`),
+        api<Experiment[]>("/api/eval/experiments?limit=100"),
+        api<PerformanceBenchmark[]>("/api/infra/performance-benchmarks?limit=20"),
+        api<DocumentCloudPolicy[]>(`/api/settings/privacy/documents?space_id=${encodeURIComponent(spaceId)}`),
+        api<InfraBudget>("/api/infra/budget"),
+      ]);
+      setOverview(overviewData); setJobs(jobData); setTraces(traceData); setIndexes(indexData);
+      setDatasets(datasetData); setExperiments(experimentData); setBenchmarks(benchmarkData); setCloudPolicies(policyData); setInfraBudget(budgetData);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "AI Infra 数据读取失败");
+    }
+  }
+
+  useEffect(() => {
+    void loadInfra();
+    const timer = window.setInterval(() => void loadInfra(), 3000);
+    return () => window.clearInterval(timer);
+  }, [spaceId]);
+
+  async function runAction(name: string, action: () => Promise<void>) {
+    setBusy(name); setNotice("");
+    try { await action(); await loadInfra(); }
+    catch (error) { setNotice(error instanceof Error ? error.message : "操作失败"); }
+    finally { setBusy(""); }
+  }
+
+  async function planGeneration() {
+    await runAction("plan-index", async () => {
+      const [chunkSize, chunkOverlap] = chunkPreset.split(":").map(Number);
+      const item = await api<IndexGeneration>("/api/infra/index-generations", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ space_id: spaceId, model: indexModel, dimension: indexDimension, strategy: indexStrategy, chunk_size: chunkSize, chunk_overlap: chunkOverlap }),
+      });
+      setPlannedIndex(item);
+    });
+  }
+
+  async function updateCloudPolicy(item: DocumentCloudPolicy, capability: "embedding" | "llm", allowed: boolean) {
+    await runAction(`policy-${item.document_id}-${capability}`, async () => {
+      await api(`/api/settings/privacy/documents/${item.document_id}`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          embedding_allowed: capability === "embedding" ? allowed : Boolean(item.embedding_allowed),
+          llm_allowed: capability === "llm" ? allowed : Boolean(item.llm_allowed),
+        }),
+      });
+    });
+  }
+
+  async function saveInfraBudget() {
+    await runAction("save-budget", async () => {
+      setInfraBudget(await api<InfraBudget>("/api/infra/budget", {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(infraBudget),
+      }));
+      setNotice("单次实验预算已保存，超限任务会在入队前被阻止。");
+    });
+  }
+
+  async function buildGeneration() {
+    if (!plannedIndex) return;
+    const confirmation = window.prompt(`本次预计处理 ${plannedIndex.estimate?.chunk_count || 0} 个 Chunk，${plannedIndex.estimate?.estimated_batches || 0} 个请求批次，缓存命中 ${Math.round((plannedIndex.estimate?.cache_hit_rate || 0) * 100)}%。\n\n请输入：重建此索引`);
+    if (confirmation !== "重建此索引") return;
+    await runAction("build-index", async () => {
+      await api(`/api/infra/index-generations/${plannedIndex.id}/build`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation }) });
+      setNotice("索引构建任务已入队，可在 Cockpit 查看进度。");
+    });
+  }
+
+  async function openTrace(id: string) {
+    await runAction(`trace-${id}`, async () => setSelectedTrace(await api<InfraTrace>(`/api/infra/traces/${id}`)));
+  }
+
+  async function openDataset(id: string) {
+    await runAction(`dataset-${id}`, async () => setSelectedDataset(await api<EvalDataset>(`/api/eval/datasets/${id}`)));
+  }
+
+  async function importLegacyDataset() {
+    await runAction("import-dataset", async () => {
+      const item = await api<EvalDataset>("/api/eval/datasets/import-legacy", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ space_id: spaceId, name: "KUN Gold Set", version: "v1" }) });
+      setSelectedDataset(item); setNotice(`已导入 ${item.case_count} 条人工题。`);
+    });
+  }
+
+  async function createCandidateDataset() {
+    const name = window.prompt("评测集名称", "KUN Gold Set 100")?.trim();
+    if (!name) return;
+    await runAction("create-dataset", async () => {
+      const item = await api<EvalDataset>("/api/eval/datasets", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ space_id: spaceId, name, version: "v1" }) });
+      setSelectedDataset(item);
+    });
+  }
+
+  async function generateCandidates() {
+    if (!selectedDataset) return;
+    const confirmation = window.prompt("候选题会把有限文档片段发送给 DeepSeek，生成后仍是 draft。\n\n请输入：生成候选题");
+    if (confirmation !== "生成候选题") return;
+    await runAction("generate-candidates", async () => {
+      await api(`/api/eval/datasets/${selectedDataset.id}/generate-candidates`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ count: 10, confirmation }) });
+      setNotice("10 条候选题已进入后台队列，完成后请逐条确认。");
+    });
+  }
+
+  async function reviewCase(caseId: string, status: "accepted" | "rejected") {
+    if (!selectedDataset) return;
+    await runAction(`case-${caseId}`, async () => setSelectedDataset(await api<EvalDataset>(`/api/eval/datasets/${selectedDataset.id}/cases/${caseId}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }),
+    })));
+  }
+
+  async function startExperiment() {
+    const dataset = selectedDataset || datasets.find((item) => (item.accepted_count || 0) > 0);
+    if (!dataset) { setNotice("请先选择包含人工确认题的评测集。"); return; }
+    if (experimentPipeline !== "bm25" && !selectedIndexId) { setNotice("Dense/Hybrid 实验需要一个已就绪的索引代次。"); return; }
+    await runAction("experiment", async () => {
+      const name = `${experimentPipeline.toUpperCase()} · ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`;
+      await api("/api/eval/experiments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+        dataset_version_id: dataset.id, name, pipeline: experimentPipeline,
+        generation_id: selectedIndexId || null, candidate_k: 20, top_k: 10, rrf_k: 60,
+        reranker_model: experimentPipeline === "hybrid_rerank" ? "qwen3-rerank" : null, split: "all",
+      }) });
+      setNotice("质量实验已入队。运行期间每道题都会保留排名、阶段耗时和 Trace。");
+    });
+  }
+
+  async function openExperiment(id: string) {
+    await runAction(`experiment-${id}`, async () => setSelectedExperiment(await api<Experiment>(`/api/eval/experiments/${id}`)));
+  }
+
+  async function runDuel() {
+    if (!duelQuestion.trim()) return;
+    await runAction("duel", async () => setDuel(await api<DuelResult>("/api/infra/retrieval-duel", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+        question: duelQuestion, space_id: spaceId,
+        left: { pipeline: duelLeft, generation_id: duelLeft === "bm25" ? selectedIndexId || null : selectedIndexId, candidate_k: 20, top_k: 10 },
+        right: { pipeline: duelRight, generation_id: selectedIndexId, candidate_k: 20, top_k: 10, reranker_model: duelRight === "hybrid_rerank" ? "qwen3-rerank" : null },
+      }),
+    })));
+  }
+
+  async function compareRuns() {
+    if (!baselineId || !candidateId) return;
+    await runAction("compare", async () => setRegression(await api<RegressionResult>("/api/eval/compare", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ baseline_id: baselineId, candidate_id: candidateId }),
+    })));
+  }
+
+  async function runBenchmark() {
+    await runAction("benchmark", async () => {
+      await api("/api/infra/performance-benchmarks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sizes: [1000, 10000], dimension: 256, query_count: 100, seed: 20260813 }) });
+      setNotice("1k / 10k 确定性向量压测已入队；结果不会被当作检索质量结论。");
+    });
+  }
+
+  const provider = (capability: string) => overview?.providers.find((item) => item.capability === capability);
+  const quality = selectedExperiment?.summary || successfulExperiments[0]?.summary;
+  const maxSpan = Math.max(1, ...(selectedTrace?.spans || []).map((item) => Number(item.duration_ms || 0)));
+
+  return <div className="page infra-page">
+    <PageHead eyebrow="AI INFRA OBSERVABILITY" title="从请求到回归结论，都能被解释" description={`当前空间：${activeSpace?.name || "默认空间"}。质量 Gold 与确定性向量压测严格分开。`} action={<span className={`infra-live ${health ? "online" : ""}`}><i />{health ? "LIVE" : "OFFLINE"}</span>} />
+    <nav className="infra-tabs">{[
+      ["cockpit", "Cockpit"], ["traces", "Trace Explorer"], ["experiments", "Experiment Studio"], ["duel", "Retrieval Duel"], ["gate", "Regression Gate"],
+    ].map(([id, label]) => <button key={id} className={tab === id ? "selected" : ""} onClick={() => setTab(id as typeof tab)}>{label}</button>)}</nav>
+    {notice && <div className="infra-notice"><span>{busy ? "运行中" : "状态"}</span>{notice}<button onClick={() => setNotice("")}>×</button></div>}
+
+    {tab === "cockpit" && <>
+      <section className="infra-kpis">
+        <article><span>Retrieval P95 · 近 50 次</span><strong>{overview?.traces.p95_ms == null ? "—" : `${overview.traces.p95_ms} ms`}</strong><small>真实 Trace，不含模拟值</small></article>
+        <article><span>任务队列</span><strong>{Number(overview?.jobs.running || 0)} <em>/ {Number(overview?.jobs.queued || 0)}</em></strong><small>运行中 / 等待中 · 可恢复</small></article>
+        <article><span>活跃索引</span><strong>{indexes.filter((item) => item.is_active).length}</strong><small>{readyIndexes.length} 个代次已验证</small></article>
+        <article><span>Evidence Recall@5</span><strong>{quality?.evidence_recall ? `${Math.round((quality.evidence_recall["5"] || 0) * 100)}%` : "待评测"}</strong><small>{quality?.case_count ? `${quality.case_count} 条人工 Gold` : "至少 1 条 accepted case"}</small></article>
+      </section>
+      <section className="infra-provider-strip">
+        {[['embedding', 'Embedding', '百炼'], ['rerank', 'Reranker', '百炼'], ['chat', 'Answer LLM', 'DeepSeek']].map(([capability, label, vendor]) => { const item = provider(capability); return <div key={capability}><i className={item?.connection_status === "connected" ? "ok" : item?.configured ? "waiting" : "off"} /><span><b>{label}</b><small>{vendor} · {item?.model || "待配置"}</small></span><strong>{item?.connection_status === "connected" ? "已验证" : item?.configured ? "待验证" : "待配置"}</strong></div>; })}
+      </section>
+      <section className="infra-pipeline"><header><div><span>REQUEST PIPELINE</span><h2>一次检索请求经过了什么</h2></div><p>每个节点生成独立 Span；失败会保留真实错误码并停止伪装执行。</p></header><div>{[["01","BM25","本地 FTS"],["02","Dense","FAISS"],["03","RRF","融合"],["04","Rerank","百炼"],["05","LLM","DeepSeek"]].map(([n, title, text], index) => <span key={title}><i>{n}</i><b>{title}</b><small>{text}</small>{index < 4 && <em>→</em>}</span>)}</div></section>
+      <div className="infra-two-columns">
+        <section className="infra-panel"><header><div><span>PERSISTENT RUNNER</span><h2>任务与恢复</h2></div><b>{jobs.filter((item) => ["queued","running","retry_wait"].includes(item.status)).length} ACTIVE</b></header><div className="infra-job-list">{jobs.slice(0, 7).map((job) => <article key={job.id}><i className={`job-${job.status}`} /><div><strong>{job.job_type.replaceAll("_", " ")}</strong><p>{job.message || job.phase}</p><span><b style={{ width: `${job.progress}%` }} /></span></div><aside><b>{job.progress}%</b><small>尝试 {job.attempt}/{job.max_attempts}</small></aside></article>)}{!jobs.length && <p className="infra-empty">队列为空，启动索引或实验后会显示真实进度。</p>}</div></section>
+        <section className="infra-panel"><header><div><span>INDEX GENERATIONS</span><h2>索引代次与回滚</h2></div><b>{readyIndexes.length} READY</b></header><div className="infra-index-list">{indexes.slice(0, 6).map((item) => <article key={item.id}><div><strong>{item.model}</strong><p>{item.dimension}d · {item.strategy.toUpperCase()} · Chunk {item.chunk_size}/{item.chunk_overlap}</p></div><span className={`infra-status ${item.status}`}>{item.is_active ? "ACTIVE" : item.status.toUpperCase()}</span><small>{item.vector_count.toLocaleString()} vectors · {formatSize(item.index_bytes || 0)}</small>{item.status === "ready" && !item.is_active && <button onClick={() => void runAction(`activate-${item.id}`, async () => { await api(`/api/infra/index-generations/${item.id}/activate`, { method: "POST" }); })}>切换</button>}</article>)}{!indexes.length && <p className="infra-empty">还没有索引代次。下方配置只会在你确认后产生云端请求。</p>}</div></section>
+      </div>
+      <section className="infra-builder"><header><div><span>IMMUTABLE INDEX BUILDER</span><h2>建立可验证、可切换的索引代次</h2></div><p>模型、维度、Chunk 与源文档指纹共同决定代次；不会覆盖现有索引。</p></header><div className="infra-form-grid"><label>Embedding<select value={indexModel} onChange={(event) => setIndexModel(event.target.value)}><option value="qwen3.7-text-embedding">qwen3.7-text-embedding</option><option value="text-embedding-v4">text-embedding-v4</option></select></label><label>维度<select value={indexDimension} onChange={(event) => setIndexDimension(Number(event.target.value))}><option value={1024}>1024</option><option value={256}>256</option></select></label><label>Chunk / overlap<select value={chunkPreset} onChange={(event) => setChunkPreset(event.target.value)}><option value="400:80">400 / 80</option><option value="700:120">700 / 120</option><option value="1000:150">1000 / 150</option></select></label><label>FAISS<select value={indexStrategy} onChange={(event) => setIndexStrategy(event.target.value)}><option value="flat">Flat · 精确</option><option value="hnsw">HNSW · ANN</option></select></label><button className="secondary-button" disabled={Boolean(busy)} onClick={() => void planGeneration()}>{busy === "plan-index" ? "计算中…" : "计算重建计划"}</button></div>{plannedIndex && <div className="infra-estimate"><div><span>Chunk</span><strong>{plannedIndex.estimate?.chunk_count || 0}</strong></div><div><span>API 批次</span><strong>{plannedIndex.estimate?.estimated_batches || 0}</strong></div><div><span>缓存命中</span><strong>{Math.round((plannedIndex.estimate?.cache_hit_rate || 0) * 100)}%</strong></div><div><span>重发字符</span><strong>{(plannedIndex.estimate?.estimated_input_characters || 0).toLocaleString()}</strong></div><div><span>费用口径</span><strong>{plannedIndex.estimate?.cost_status === "estimated" ? "估算" : "实际"}</strong></div><button className="primary-button" disabled={Boolean(busy)} onClick={() => void buildGeneration()}>确认并入队</button></div>}</section>
+      <section className="infra-panel cloud-policy-panel"><header><div><span>DATA EGRESS POLICY</span><h2>逐份资料授权云端处理</h2></div><b>{cloudPolicies.filter((item) => item.embedding_allowed || item.llm_allowed).length} / {cloudPolicies.length} ALLOWED</b></header><p>默认全部关闭。Embedding 授权控制发送 Chunk 到百炼；LLM 授权控制发送检索片段给 DeepSeek，包括候选题生成。</p><div className="infra-budget-row"><label>单次 API 请求上限<input type="number" min={1} max={10000} value={infraBudget.max_api_requests_per_run} onChange={(event) => setInfraBudget({ ...infraBudget, max_api_requests_per_run: Number(event.target.value) })} /></label><label>单次发送字符上限<input type="number" min={1000} max={100000000} value={infraBudget.max_embedding_input_characters} onChange={(event) => setInfraBudget({ ...infraBudget, max_embedding_input_characters: Number(event.target.value) })} /></label><label><input type="checkbox" checked={infraBudget.allow_multi_model_rebuild} onChange={(event) => setInfraBudget({ ...infraBudget, allow_multi_model_rebuild: event.target.checked })} /> 允许多模型重复建索引</label><button onClick={() => void saveInfraBudget()}>保存预算</button></div><div>{cloudPolicies.map((item) => <article key={item.document_id}><span><strong>{item.title}</strong><small>{item.original_name}</small></span><label><input type="checkbox" checked={Boolean(item.embedding_allowed)} onChange={(event) => void updateCloudPolicy(item, "embedding", event.target.checked)} /> 百炼 Embedding</label><label><input type="checkbox" checked={Boolean(item.llm_allowed)} onChange={(event) => void updateCloudPolicy(item, "llm", event.target.checked)} /> DeepSeek LLM</label></article>)}{!cloudPolicies.length && <p className="infra-empty">当前空间没有资料。添加资料后，必须在这里明确允许才会发送到云端。</p>}</div></section>
+    </>}
+
+    {tab === "traces" && <div className="infra-trace-layout"><section className="infra-panel trace-master"><header><div><span>TRACE EXPLORER</span><h2>最近请求</h2></div><b>{traces.length} TRACES</b></header>{traces.map((trace) => <button key={trace.id} className={selectedTrace?.id === trace.id ? "selected" : ""} onClick={() => void openTrace(trace.id)}><i className={trace.status} /><span><strong>{trace.name.replaceAll("_", " ")}</strong><small>{trace.trace_type} · {formatDate(trace.started_at)}</small></span><b>{trace.duration_ms == null ? "running" : `${trace.duration_ms} ms`}</b></button>)}</section><section className="infra-panel trace-detail"><header><div><span>SPAN WATERFALL</span><h2>{selectedTrace?.name.replaceAll("_", " ") || "选择一个 Trace"}</h2></div>{selectedTrace && <b>{selectedTrace.status.toUpperCase()}</b>}</header>{selectedTrace ? <><div className="trace-summary-line"><span>ID {selectedTrace.id.slice(0, 12)}</span><span>{selectedTrace.spans?.length || 0} spans</span><span>{selectedTrace.duration_ms || 0} ms</span></div><div className="span-waterfall">{(selectedTrace.spans || []).map((span) => <article key={span.id}><span><strong>{span.operation}</strong><small>{span.kind}</small></span><div><i className={span.status} style={{ width: `${Math.max(3, Number(span.duration_ms || 0) / maxSpan * 100)}%` }} /></div><b>{span.duration_ms || 0} ms</b></article>)}</div><details><summary>Trace attributes</summary><pre>{JSON.stringify(selectedTrace.attributes, null, 2)}</pre></details></> : <p className="infra-empty">从左侧选择请求，查看 BM25、FAISS、RRF、Rerank、LLM 与缓存阶段的真实耗时。</p>}</section></div>}
+
+    {tab === "experiments" && <>
+      <div className="quality-separation"><div><b>QUALITY TRACK</b><strong>人工 Gold · 真实文档</strong><p>用于 Recall、MRR、nDCG、Bad Case；候选题未经确认不计分。</p></div><i>≠</i><div><b>PERFORMANCE TRACK</b><strong>确定性生成向量</strong><p>只用于延迟、QPS、内存和 ANN Recall，不宣称检索准确率。</p></div></div>
+      <div className="infra-two-columns experiment-top"><section className="infra-panel"><header><div><span>DATASET VERSIONING</span><h2>Gold 数据集</h2></div><div><button onClick={() => void importLegacyDataset()}>导入现有题</button><button onClick={() => void createCandidateDataset()}>新建</button></div></header><div className="dataset-list">{datasets.map((item) => <button key={item.id} className={selectedDataset?.id === item.id ? "selected" : ""} onClick={() => void openDataset(item.id)}><span><strong>{item.name} <i>{item.version}</i></strong><small>{item.accepted_count || 0} accepted · {item.draft_count || 0} draft</small></span><b>{item.status}</b></button>)}{!datasets.length && <p className="infra-empty">可先导入已有 30 条题，或创建 100 条 Gold 工作集。</p>}</div></section><section className="infra-panel"><header><div><span>EXPERIMENT CONFIG</span><h2>一次只改变一个变量</h2></div><b>REPRODUCIBLE</b></header><div className="experiment-controls"><label>Pipeline<select value={experimentPipeline} onChange={(event) => setExperimentPipeline(event.target.value)}><option value="bm25">BM25</option><option value="dense">Dense</option><option value="hybrid">BM25 + Dense + RRF</option><option value="hybrid_rerank">Hybrid + qwen3-rerank</option></select></label><label>索引代次<select value={selectedIndexId} onChange={(event) => setExperimentIndex(event.target.value)}><option value="">BM25 不使用向量索引</option>{readyIndexes.map((item) => <option value={item.id} key={item.id}>{item.model} · {item.dimension}d · {item.chunk_size}/{item.chunk_overlap}</option>)}</select></label><button className="primary-button" disabled={Boolean(busy) || !datasets.length} onClick={() => void startExperiment()}>{busy === "experiment" ? "入队中…" : "运行质量实验"}</button></div><p className="experiment-rule">每次保存 Dataset hash、配置 hash、Git revision、机器信息和逐题排名。Recall@10 强制检索至少 10 条结果。</p></section></div>
+      {selectedDataset && <section className="infra-panel gold-workbench"><header><div><span>HUMAN REVIEW</span><h2>{selectedDataset.name} · 人工 Gold 工作台</h2></div><div><b>{selectedDataset.cases?.filter((item) => item.status === "accepted").length || 0} / 100</b><button disabled={Boolean(busy)} onClick={() => void generateCandidates()}>＋ 生成 10 条 draft</button></div></header><div>{(selectedDataset.cases || []).slice(0, 20).map((item, index) => <article key={item.id}><i>{String(index + 1).padStart(2, "0")}</i><span><strong>{item.question}</strong><small>{item.query_type} · {item.difficulty} · {item.gold?.[0]?.title} {item.gold?.[0]?.locator}</small></span><b className={`case-${item.status}`}>{item.status}</b>{item.status === "draft" && <aside><button onClick={() => void reviewCase(item.id, "rejected")}>拒绝</button><button onClick={() => void reviewCase(item.id, "accepted")}>确认 Gold</button></aside>}</article>)}</div></section>}
+      <section className="infra-panel experiment-results"><header><div><span>EXPERIMENT RUNS</span><h2>指标与 Bad Case</h2></div><b>{successfulExperiments.length} COMPLETED</b></header><div className="experiment-table"><div className="experiment-head"><span>Run</span><span>Pipeline</span><span>Evidence R@5</span><span>MRR</span><span>P95</span><span>Status</span></div>{experiments.slice(0, 12).map((item) => <button key={item.id} onClick={() => void openExperiment(item.id)}><span><strong>{item.name}</strong><small>{formatDate(item.created_at)}</small></span><span>{String(item.config.pipeline || "—")}</span><span>{item.summary.evidence_recall ? `${Math.round((item.summary.evidence_recall["5"] || 0) * 100)}%` : "—"}</span><span>{item.summary.mrr ?? "—"}</span><span>{item.summary.latency_ms?.p95 ? `${item.summary.latency_ms.p95} ms` : "—"}</span><span className={`infra-status ${item.status}`}>{item.status}</span></button>)}</div></section>
+      {selectedExperiment && <section className="infra-panel bad-cases"><header><div><span>BAD CASE ANALYSIS</span><h2>{selectedExperiment.name}</h2></div><button onClick={() => setSelectedExperiment(null)}>关闭</button></header><div className="metric-row">{[["Document R@5", selectedExperiment.summary.document_recall?.["5"]], ["Evidence R@5", selectedExperiment.summary.evidence_recall?.["5"]], ["MRR", selectedExperiment.summary.mrr], ["nDCG@10", selectedExperiment.summary.ndcg_10], ["Citation", selectedExperiment.summary.citation_resolvable_rate]].map(([label, value]) => <div key={String(label)}><span>{label}</span><strong>{typeof value === "number" ? `${Math.round(value * 1000) / 10}%` : "—"}</strong></div>)}</div><div className="bad-case-list">{(selectedExperiment.cases || []).filter((item) => item.failure_category).map((item) => <article key={item.case_id}><b>{item.failure_category}</b><span><strong>{item.question}</strong><small>{item.latency_ms} ms · 返回 {item.rankings.returned?.length || 0} 个候选</small></span></article>)}{!(selectedExperiment.cases || []).some((item) => item.failure_category) && <p className="infra-empty">本次运行没有 Bad Case。</p>}</div></section>}
+    </>}
+
+    {tab === "duel" && <><section className="duel-controls"><div><span>RETRIEVAL DUEL</span><h2>同一道题，逐阶段看排名为什么改变</h2></div><input value={duelQuestion} onChange={(event) => setDuelQuestion(event.target.value)} /><label>A<select value={duelLeft} onChange={(event) => setDuelLeft(event.target.value)}><option value="bm25">BM25</option><option value="dense">Dense</option><option value="hybrid">Hybrid</option></select></label><label>B<select value={duelRight} onChange={(event) => setDuelRight(event.target.value)}><option value="dense">Dense</option><option value="hybrid">Hybrid</option><option value="hybrid_rerank">Hybrid + Rerank</option></select></label><button className="primary-button" disabled={Boolean(busy) || !readyIndexes.length} onClick={() => void runDuel()}>{busy === "duel" ? "对比中…" : "开始对决"}</button></section>{duel ? <div className="duel-grid">{[["A", duel.left, duelLeft], ["B", duel.right, duelRight]].map(([side, result, pipeline]) => { const value = result as DuelResult["left"]; return <section className="infra-panel" key={String(side)}><header><div><span>CONFIG {side as string}</span><h2>{String(pipeline).toUpperCase()}</h2></div><b>{value.duration_ms} ms</b></header><div className="duel-stages">{value.stages.map((stage) => <span key={stage.stage}><b>{stage.stage}</b><i>{stage.duration_ms} ms</i><small>{stage.count} candidates</small></span>)}</div><div className="duel-ranking">{value.results.slice(0, 8).map((item, index) => <article key={item.id}><i>{index + 1}</i><span><strong>{item.title}</strong><p>{String(item.text || "").slice(0, 90)}</p><small>{item.locator} · lexical #{item.lexical_rank || "—"} · dense #{item.vector_rank || "—"} · rerank #{item.rerank_rank || "—"}</small></span><b>{Number(item.score || item.rerank_score || 0).toFixed(4)}</b></article>)}</div></section>; })}</div> : <div className="duel-empty"><strong>选择一个已就绪索引后开始</strong><p>两边分别生成真实 Trace；结果保留 BM25、Dense、Fusion 和 Rerank 的阶段排名。</p></div>}</>}
+
+    {tab === "gate" && <><div className="infra-two-columns"><section className="infra-panel regression-config"><header><div><span>REGRESSION GATE</span><h2>候选版本不能悄悄变差</h2></div><b>{regression?.status === "passed" ? "PASS" : regression ? "BLOCK" : "WAITING"}</b></header><label>Baseline<select value={baselineId} onChange={(event) => setBaselineId(event.target.value)}><option value="">选择基线实验</option>{successfulExperiments.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>Candidate<select value={candidateId} onChange={(event) => setCandidateId(event.target.value)}><option value="">选择候选实验</option>{successfulExperiments.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><button className="primary-button" disabled={!baselineId || !candidateId || Boolean(busy)} onClick={() => void compareRuns()}>运行回归门禁</button>{regression && <div className="gate-checks">{regression.checks.map((check) => <article key={check.name}><i>{check.status === "passed" ? "✓" : "!"}</i><span><strong>{check.name}</strong><small>{check.rule}</small></span><b>{check.delta > 0 ? "+" : ""}{check.delta}</b></article>)}</div>}</section><section className="infra-panel performance-lab"><header><div><span>PERFORMANCE BENCHMARK</span><h2>FAISS 规模压测</h2></div><b>NO QUALITY CLAIM</b></header><p>生成固定 seed 的 1k / 10k 向量，对比 Flat 与 HNSW 的构建时间、P50/P95/P99、QPS 和 ANN Recall。</p><button className="secondary-button" disabled={Boolean(busy)} onClick={() => void runBenchmark()}>{busy === "benchmark" ? "入队中…" : "运行 1k / 10k 压测"}</button><div className="benchmark-list">{benchmarks.slice(0, 4).map((item) => <article key={item.id}><span><strong>{(item.config.sizes || []).map((value: number) => value.toLocaleString()).join(" / ")} vectors</strong><small>{item.config.dimension}d · seed {item.config.seed}</small></span><b className={`infra-status ${item.status}`}>{item.status}</b>{item.result.results?.filter((result) => result.status === "measured").map((result) => <em key={result.size}>{Number(result.size).toLocaleString()}: Flat P95 {result.flat?.p95_ms} ms · HNSW {result.hnsw?.p95_ms} ms · ANN R@10 {Math.round((result.hnsw?.ann_recall_10 || 0) * 100)}%</em>)}</article>)}</div></section></div>{regression && <section className={`regression-verdict ${regression.status}`}><i>{regression.status === "passed" ? "✓" : "!"}</i><div><span>RELEASE DECISION</span><h2>{regression.status === "passed" ? "候选配置通过门禁" : "候选配置被阻塞"}</h2><p>Evidence Recall 差值 95% CI：[{regression.confidence.evidence_recall_delta_95_ci.join(", ")}] · paired bootstrap {regression.confidence.samples} 次。</p></div></section>}</>}
+  </div>;
+}
+
 function IndexStatusModal({ status, close, reindex }: { status: DocumentStatus; close: () => void; reindex: () => void }) {
   const labels: Record<string, string> = { ready: "可检索", lexical_ready: "关键词可检索，语义索引中", indexing: "正在索引", failed: "索引失败", missing: "本地副本缺失", stale: "待重新索引" };
   return <div className="modal-backdrop"><section className="index-status-modal"><header><div><span>索引详情</span><h2>{status.title}</h2><p>{status.original_name}</p></div><button onClick={close}>×</button></header><div className={`status-hero status-${status.status}`}><i /> <strong>{labels[status.status] || status.status}</strong><p>{status.status === "ready" ? "本地副本和检索索引均可使用。" : status.status === "missing" ? "KUN 资料库中的独立副本已不存在，当前索引不可继续核对原文。" : status.latest_job?.message || "查看下方详细状态。"}</p></div><dl><div><dt>KUN 本地副本</dt><dd>{status.library_copy_exists ? "存在" : "缺失"}</dd></div><div><dt>知识片段</dt><dd>{status.chunk_count} 个</dd></div><div><dt>语义向量</dt><dd>{status.embedding_count} 个</dd></div><div><dt>Embedding 模型</dt><dd>{status.embedding_model || "仅 BM25"}</dd></div><div><dt>最后更新</dt><dd>{formatDate(status.updated_at)}</dd></div><div><dt>副本位置</dt><dd title={status.library_path}>{status.library_path}</dd></div></dl><footer><button className="ghost-button" onClick={() => void navigator.clipboard.writeText(status.library_path)}>复制副本路径</button><button className="primary-button" disabled={!status.library_copy_exists || status.status === "indexing"} onClick={reindex}>重新建立索引</button></footer></section></div>;
@@ -1316,7 +1607,7 @@ function SettingsView({ providers, health, testProvider }: { providers: Provider
     <PageHead eyebrow="SETTINGS" title="设置" description="模型连接、本地数据、备份与权限边界都在这里真实生效。" />
     <div className="settings-layout"><nav><button className={section === "models" ? "selected" : ""} onClick={() => setSection("models")}>模型与 API</button><button className={section === "storage" ? "selected" : ""} onClick={() => setSection("storage")}>存储与备份</button><button className={section === "privacy" ? "selected" : ""} onClick={() => setSection("privacy")}>隐私与权限</button></nav><section>
       {notice && <div className="settings-notice">{notice}</div>}
-      {section === "models" && <>{providers.map((provider) => <div className="setting-section" key={provider.provider}><h3>{provider.capability === "chat" ? "对话模型" : "Embedding 模型"}</h3><p>{provider.capability === "chat" ? "负责理解问题、规划 Tool 和生成回答。" : "负责将文档片段与问题转换为语义向量。"}</p><div className="model-row"><div className={`provider-logo ${provider.provider === "deepseek" ? "deepseek" : "aliyun"}`}>{provider.provider === "deepseek" ? "D" : "A"}</div><div><strong>{provider.label}</strong><small>{provider.model}</small></div><ProviderBadge provider={provider} /><button onClick={() => testProvider(provider.provider)} disabled={!provider.configured}>测试连接</button></div></div>)}
+      {section === "models" && <>{providers.map((provider) => <div className="setting-section" key={provider.provider}><h3>{provider.capability === "chat" ? "对话模型" : provider.capability === "rerank" ? "Reranker 模型" : "Embedding 模型"}</h3><p>{provider.capability === "chat" ? "负责理解问题、规划 Tool 和生成回答。" : provider.capability === "rerank" ? "负责对融合候选重新排序，需要配置百炼工作空间 Rerank 地址。" : "负责将文档片段与问题转换为语义向量。"}</p><div className="model-row"><div className={`provider-logo ${provider.provider === "deepseek" ? "deepseek" : "aliyun"}`}>{provider.provider === "deepseek" ? "D" : "A"}</div><div><strong>{provider.label}</strong><small>{provider.model}</small></div><ProviderBadge provider={provider} /><button onClick={() => testProvider(provider.provider)} disabled={!provider.configured}>测试连接</button></div></div>)}
         <div className="setting-section inline-settings"><div><h3>本地服务</h3><p>FastAPI 仅监听 127.0.0.1</p></div><span className={health ? "connected" : "failed-state"}>{health ? "● 正常" : "● 未连接"}</span></div></>}
       {section === "storage" && (storage ? <div className="storage-settings">
         <div className="storage-hero"><div><span>本地数据总量</span><strong>{formatSize(storage.total_bytes)}</strong><p title={storage.data_dir}>{storage.data_dir}</p></div><div><button className="secondary-button" onClick={() => void api("/api/settings/storage/open", { method: "POST" })}>打开资料位置</button><button className="primary-button" disabled={busy === "backup"} onClick={() => void createBackup()}>{busy === "backup" ? "正在备份…" : "立即创建备份"}</button></div></div>
@@ -1403,7 +1694,7 @@ function Onboarding({ step, setStep, finish, providers, testProvider, backendOnl
   const steps = [
     { n: "01", title: "欢迎认识坤坤", text: "你的个人私域知识智能体。文件、索引和 Memory 默认保存在这台电脑上。", visual: <div className="welcome-visual"><div className="kun-orb">K</div><i className="orbit one" /><i className="orbit two" /></div> },
     { n: "02", title: "选择本地资料库", text: "KUN 会复制一份资料用于稳定引用，原始文件不会被修改。", visual: <div className="folder-visual"><span>▰</span><p>{libraryName}</p><button onClick={chooseLibraryFolder}>更改位置</button></div> },
-    { n: "03", title: "验证模型能力", text: "只有真实测试成功后才显示绿色“已连接”。", visual: <div className="setup-options">{providers.map((provider) => <div key={provider.provider}><b>{provider.provider === "deepseek" ? "D" : "A"}</b><span>{provider.capability === "chat" ? "对话模型" : "Embedding"}<strong>{provider.label} · {provider.model}</strong></span><ProviderBadge provider={provider} /><button onClick={() => testProvider(provider.provider)} disabled={!backendOnline || !provider.configured}>测试</button></div>)}</div> },
+    { n: "03", title: "验证模型能力", text: "只有真实测试成功后才显示绿色“已连接”。", visual: <div className="setup-options">{providers.map((provider) => <div key={provider.provider}><b>{provider.provider === "deepseek" ? "D" : "A"}</b><span>{provider.capability === "chat" ? "对话模型" : provider.capability === "rerank" ? "Reranker" : "Embedding"}<strong>{provider.label} · {provider.model}</strong></span><ProviderBadge provider={provider} /><button onClick={() => testProvider(provider.provider)} disabled={!backendOnline || !provider.configured}>测试</button></div>)}</div> },
     { n: "04", title: "创建第一个知识空间", text: "默认空间会由本地后端创建，之后可以继续增加和隔离不同主题。", visual: <div className="space-name"><label>知识空间名称<input value="AI Agent 学习" readOnly /></label><div><span>本地保存</span><span>独立索引</span><span>可追溯引用</span></div></div> },
   ];
   const current = steps[step];

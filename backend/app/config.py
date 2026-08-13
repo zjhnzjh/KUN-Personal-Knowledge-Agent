@@ -16,6 +16,9 @@ class Settings:
     dashscope_api_key: str
     dashscope_base_url: str
     embedding_model: str
+    embedding_dimension: int
+    dashscope_rerank_base_url: str
+    rerank_model: str
     vision_model: str
 
 
@@ -32,5 +35,8 @@ def get_settings() -> Settings:
         dashscope_api_key=os.getenv("DASHSCOPE_API_KEY", "").strip() or get_secret("dashscope"),
         dashscope_base_url=os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").rstrip("/"),
         embedding_model=os.getenv("DASHSCOPE_EMBEDDING_MODEL", "qwen3.7-text-embedding"),
+        embedding_dimension=int(os.getenv("DASHSCOPE_EMBEDDING_DIMENSION", "1024")),
+        dashscope_rerank_base_url=os.getenv("DASHSCOPE_RERANK_BASE_URL", "").rstrip("/"),
+        rerank_model=os.getenv("DASHSCOPE_RERANK_MODEL", "qwen3-rerank"),
         vision_model=os.getenv("DASHSCOPE_VISION_MODEL", "qwen3-vl-flash"),
     )

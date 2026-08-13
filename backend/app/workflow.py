@@ -15,7 +15,7 @@ from .config import get_settings
 from .context import build_context, estimate_tokens
 from .database import connect, json_value, now, rows
 from .memory import recall_memories
-from .privacy import get_privacy_settings
+from .privacy import allowed_for_cloud, get_privacy_settings
 from .tools import REGISTRY, ToolContext, ToolExecutionError, invoke_tool
 
 
@@ -486,7 +486,10 @@ def generate(state: AgentState) -> AgentState:
     context_plan = state.get("context_plan") or build_context(state.get("conversation_id"), state["question"])
     history_context = context_plan.get("history_text", "")
     summary_context = context_plan.get("summary_text", "")
-    if settings.deepseek_api_key:
+    local_document_ids = list({str(item["document_id"]) for item in contexts if item.get("kind", "document") == "document" and item.get("document_id")})
+    llm_allowed_documents = allowed_for_cloud(local_document_ids, "llm")
+    cloud_generation_allowed = not local_document_ids or set(local_document_ids).issubset(llm_allowed_documents)
+    if settings.deepseek_api_key and cloud_generation_allowed:
         response = httpx.post(
             f"{settings.deepseek_base_url}/chat/completions",
             headers={"Authorization": f"Bearer {settings.deepseek_api_key}"},
@@ -512,7 +515,8 @@ def generate(state: AgentState) -> AgentState:
         response.raise_for_status()
         answer = response.json()["choices"][0]["message"]["content"]
     else:
-        answer = "我找到了以下相关资料，但尚未配置对话模型，因此先展示可核对的证据：\n\n" + "\n\n".join(f"[{i}] {item['text'][:260]}" for i, item in enumerate(contexts, 1))
+        reason = "这些资料没有授权发送给 DeepSeek" if settings.deepseek_api_key else "尚未配置对话模型"
+        answer = f"我找到了以下相关资料，但{reason}，因此先展示可核对的本地证据：\n\n" + "\n\n".join(f"[{i}] {item['text'][:260]}" for i, item in enumerate(contexts, 1))
     answer = normalize_citation_markers(answer, len(citations))
     valid_ids = {item["id"] for item in citations}
     answer = re.sub(

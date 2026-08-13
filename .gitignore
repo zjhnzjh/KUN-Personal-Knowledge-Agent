@@ -12,6 +12,8 @@
 
 # testing
 /coverage
+.pytest_cache/
+backend/.test-tmp*/
 
 # next.js
 /.next/

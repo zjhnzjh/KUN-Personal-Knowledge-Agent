@@ -22,6 +22,9 @@ KUN 是一个面向 Windows 的本地优先个人知识智能体。它将 PDF、
 - Skill 中心：查看内置 Skill 的 `SKILL.md`、Tool、权限和超时，并可视化创建符合 frontmatter 规范的个人 Skill。
 - Tool 中心：查看真实可用性和运行记录；`web.fetch` 可安全读取用户明确提供的公开 HTTPS 网页，`web.search` 在搜索提供方未配置时明确显示不可用。
 - RAG 实验室：创建人工标注问题，实际运行 Recall@K、MRR、nDCG、平均延迟和 P95 延迟，并查看逐题命中排名。
+- AI Infra 控制台：持久任务队列、心跳与重启恢复、Trace/Span 瀑布、不可变索引代次、Retrieval Duel、实验矩阵、Bad Case 和回归门禁。
+- 可复现实验：真正按 400/700/1000 三种 Chunk 配置重切片，隔离 Embedding 模型与维度缓存，并记录数据集 hash、配置 hash、Git revision 和机器信息。
+- 性能压测：使用固定 seed 的 1k/10k/100k 生成向量测量 Flat/HNSW 构建、QPS、P50/P95/P99 与 ANN Recall；与人工 Gold 质量结果严格分开。
 - 多知识空间：默认提供“AI Agent 学习”“课程与读书”“个人项目”“求职与成长”，也可新建空间。
 - Agent Workflow：LangGraph 负责 Query 理解、Skill/Tool 选择、检索、回答与 Memory 建议。
 - Tool System：统一参数校验、权限范围、可用状态、错误与 SQLite 执行记录；不显示虚假成功。
@@ -61,7 +64,9 @@ http://127.0.0.1:3000/
 | 索引缺失 | 本地副本仍在，但索引记录不完整，需要重新建立 |
 | 副本缺失 | KUN 资料库内的独立副本已不存在，无法继续检索 |
 
-导入确认后，KUN 会把文件复制到 `%LOCALAPPDATA%\KUN\library`。因此，删除电脑原位置的文件不会影响检索；只有删除 KUN 保存的副本或删除资料记录，才会让它失效。
+AI Infra 开发副本使用 `%LOCALAPPDATA%\KUN-AI-Infra`；稳定版仍使用 `%LOCALAPPDATA%\KUN`。两者的数据库、资料副本和索引互不覆盖。
+
+导入确认后，KUN 会把文件复制到对应数据目录的 `library`。因此，删除电脑原位置的文件不会影响检索；只有删除 KUN 保存的副本或删除资料记录，才会让它失效。
 
 ## 数据与隐私边界
 
@@ -83,10 +88,12 @@ FastAPI loopback API
         ├── LangGraph ── Understand / Select Skill / Retrieve / Answer / Memory
         ├── Tool registry ── Schema / Permission / Availability / Trace
         ├── Hybrid RAG ── SQLite FTS5(BM25) + dense vectors + fusion
+        ├── AI Infra ── Persisted jobs / Trace spans / FAISS generations
+        ├── Eval runner ── Gold datasets / experiments / regression gates
         └── Local storage ── SQLite / copied source files / index metadata
 ```
 
-更完整的工程说明见 `docs/ARCHITECTURE.md`，Tool 契约见 `docs/TOOLS.md`。
+更完整的工程说明见 `docs/ARCHITECTURE.md`，AI Infra 操作说明见 `docs/AI_INFRA.md`，Tool 契约见 `docs/TOOLS.md`。
 
 ## 开发运行
 
@@ -133,9 +140,11 @@ npm test
 
 项目不会用几个演示问题夸大准确率。RAG 评估应记录数据集版本、模型版本、Chunk 策略、Recall@5/10、MRR、nDCG@10、引用定位成功率、延迟和费用。正式发布指标前，需要建立经过人工标注的评估集。
 
+质量实验仅统计 `accepted` 的人工 Gold；DeepSeek 生成的问题默认是 `draft`。确定性生成向量只用于基础设施性能压测，不能用于准确率宣传。实验报告可通过 `/api/eval/experiments/{run_id}/report` 导出 Markdown 或 JSON。
+
 ## 后续里程碑
 
-- FAISS 持久增量索引与更完整的 RRF/Rerank 实验对比。
+- 完成 100 条人工 Gold，并在实际 API 配置下发布第一份可复现实验报告。
 - Excel 表格结构、合并单元格和单元格级引用。
 - PaddleOCR 本地模式与视觉模型模式切换。
 - 视频转写、关键帧/OCR、时间戳引用。

@@ -34,6 +34,14 @@ def provider_statuses() -> list[dict]:
             "model": settings.embedding_model,
             "base_url_host": urlparse(settings.dashscope_base_url).hostname,
         },
+        {
+            "provider": "dashscope-rerank",
+            "label": "百炼 Rerank",
+            "capability": "rerank",
+            "configured": bool(settings.dashscope_api_key and settings.dashscope_rerank_base_url),
+            "model": settings.rerank_model,
+            "base_url_host": urlparse(settings.dashscope_rerank_base_url).hostname,
+        },
     ]
     for item in definitions:
         state = persisted.get(item["provider"], {})
@@ -88,6 +96,25 @@ def test_provider(provider: str) -> dict:
             if not data or not data[0].get("embedding"):
                 return _failure(provider, "invalid_response", "Embedding 返回格式异常")
             return _success(provider, settings.embedding_model, dimension=len(data[0]["embedding"]))
+        if provider == "dashscope-rerank":
+            if not settings.dashscope_api_key or not settings.dashscope_rerank_base_url:
+                return _failure(provider, "not_configured", "请先配置百炼 API Key 和 Rerank 工作空间地址")
+            response = httpx.post(
+                f"{settings.dashscope_rerank_base_url}/reranks",
+                headers={"Authorization": f"Bearer {settings.dashscope_api_key}"},
+                json={
+                    "model": settings.rerank_model,
+                    "query": "KUN connection test",
+                    "documents": ["KUN connection test", "unrelated document"],
+                    "top_n": 2,
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            results = response.json().get("results", [])
+            if not results or "relevance_score" not in results[0]:
+                return _failure(provider, "invalid_response", "Rerank 返回格式异常")
+            return _success(provider, settings.rerank_model, result_count=len(results))
         raise ValueError("未知模型提供方")
     except httpx.HTTPStatusError as error:
         status = error.response.status_code

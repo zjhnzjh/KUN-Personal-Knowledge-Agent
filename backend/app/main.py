@@ -27,12 +27,44 @@ from .evaluation_dataset import HELLO_AGENTS_DOCUMENT, HELLO_AGENTS_EVALUATION_C
 from .agent_evaluation import GATE_TARGET, REFUSAL_CASES, ROUTE_CASES
 from .images import IMAGE_TYPES, index_image_document, search_images, understand_image
 from .learning import agent_traces, learning_overview
+from .infra import JobContext, LocalJobRunner, infra_summary, list_traces, trace_detail
 from .memory import find_conflict, memory_detail, record_memory_event
 from .providers import generate_document_metadata, provider_statuses, save_provider_key, test_provider
-from .privacy import get_privacy_settings, save_privacy_settings
+from .privacy import allowed_for_cloud, document_cloud_policies, get_privacy_settings, save_document_cloud_policy, save_privacy_settings
 from .rag import DashScopeEmbeddings, ParsedSection, SUPPORTED, chunk_sections, fingerprint, lexical_text, parse_document, search
+from .retrieval_engine import (
+    activate_generation,
+    build_index_generation,
+    create_index_generation,
+    estimate_index_generation,
+    get_index_generation,
+    list_index_generations,
+    pipeline_search,
+)
+from .experiments import (
+    candidate_generation_estimate,
+    compare_experiments,
+    create_dataset,
+    create_experiment_run,
+    create_performance_benchmark,
+    dataset_detail,
+    experiment_detail,
+    generate_candidate_cases,
+    import_legacy_dataset,
+    list_datasets,
+    list_experiments,
+    list_performance_benchmarks,
+    performance_detail,
+    render_experiment_report,
+    run_experiment,
+    run_performance_benchmark,
+    update_dataset_case,
+)
 from .tools import REGISTRY, ToolContext, tool_runs
 from .workflow import build_plan, detect_memory_candidate, generate, run, understand
+
+
+INFRA_RUNNER = LocalJobRunner(max_workers=2)
 
 
 @asynccontextmanager
@@ -51,21 +83,32 @@ async def lifespan(_: FastAPI):
                 "UPDATE indexing_jobs SET status='queued',phase='queued',message='服务恢复，索引任务已重新排队',updated_at=? WHERE id=?",
                 (now(), job["id"]),
             )
+    INFRA_RUNNER.start()
     for job in interrupted:
-        INDEX_EXECUTOR.submit(_run_index_job, job["id"], job["document_id"], job["library_path"])
+        INFRA_RUNNER.enqueue(
+            "index_document",
+            {"job_id": job["id"], "document_id": job["document_id"], "library_path": job["library_path"]},
+            idempotency_key=f"legacy-index:{job['id']}",
+        )
     with connect() as db:
         pending_images = db.execute(
             """SELECT d.id FROM documents d LEFT JOIN image_assets i ON i.document_id=d.id
                WHERE d.file_type IN ('png','jpg','jpeg') AND (i.document_id IS NULL OR i.status='failed')"""
         ).fetchall()
     for image in pending_images:
-        INDEX_EXECUTOR.submit(index_image_document, image["id"])
-    yield
+        INFRA_RUNNER.enqueue(
+            "analyze_image",
+            {"document_id": image["id"]},
+            idempotency_key=f"image-analysis:{image['id']}",
+        )
+    try:
+        yield
+    finally:
+        INFRA_RUNNER.shutdown()
 
 
 app = FastAPI(title="KUN Local API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:3000", "http://localhost:3000", "tauri://localhost"], allow_methods=["*"], allow_headers=["*"])
-INDEX_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="kun-index")
 EMBEDDING_WORKERS = 3
 
 
@@ -121,6 +164,11 @@ class PrivacySettingsUpdate(BaseModel):
     memory_suggestions_enabled: bool | None = None
 
 
+class DocumentCloudPolicyUpdate(BaseModel):
+    embedding_allowed: bool
+    llm_allowed: bool
+
+
 class BackupRestoreRequest(BaseModel):
     backup_id: str = Field(min_length=10, max_length=180)
     confirmation: str
@@ -150,6 +198,105 @@ class WebFetchRequest(BaseModel):
     url: str = Field(pattern=r"^https://", max_length=2048)
 
 
+class IndexGenerationCreate(BaseModel):
+    space_id: str = "ai-agent-learning"
+    model: str = Field(default="qwen3.7-text-embedding", max_length=120)
+    dimension: int = Field(default=1024)
+    strategy: str = Field(default="flat", pattern=r"^(flat|hnsw)$")
+    chunk_size: int = Field(default=700, ge=200, le=2000)
+    chunk_overlap: int = Field(default=120, ge=0, le=500)
+
+
+class IndexBuildRequest(BaseModel):
+    confirmation: str
+
+
+class ExperimentCreate(BaseModel):
+    dataset_version_id: str
+    name: str = Field(min_length=2, max_length=120)
+    pipeline: str = Field(default="bm25", pattern=r"^(bm25|dense|hybrid|hybrid_rerank)$")
+    generation_id: str | None = None
+    candidate_k: int = Field(default=20, ge=5, le=100)
+    top_k: int = Field(default=10, ge=10, le=20)
+    rrf_k: int = Field(default=60, ge=1, le=200)
+    reranker_model: str | None = None
+    split: str = Field(default="dev", pattern=r"^(dev|holdout|all)$")
+    parent_run_id: str | None = None
+
+
+class DatasetImportRequest(BaseModel):
+    space_id: str = "ai-agent-learning"
+    name: str = Field(default="KUN Gold Set", min_length=2, max_length=120)
+    version: str = Field(default="v1", min_length=1, max_length=40)
+
+
+class DatasetCreateRequest(BaseModel):
+    space_id: str = "ai-agent-learning"
+    name: str = Field(min_length=2, max_length=120)
+    version: str = Field(default="v1", min_length=1, max_length=40)
+
+
+class CandidateGenerateRequest(BaseModel):
+    count: int = Field(default=10, ge=1, le=20)
+    confirmation: str
+
+
+class EvalCaseUpdateRequest(BaseModel):
+    question: str | None = Field(default=None, min_length=2, max_length=1000)
+    status: str | None = Field(default=None, pattern=r"^(draft|accepted|rejected)$")
+    gold: list[dict] | None = None
+
+
+class RetrievalDuelRequest(BaseModel):
+    question: str = Field(min_length=2, max_length=4000)
+    space_id: str = "ai-agent-learning"
+    left: dict
+    right: dict
+
+
+class ExperimentCompareRequest(BaseModel):
+    baseline_id: str
+    candidate_id: str
+
+
+class PerformanceBenchmarkCreate(BaseModel):
+    sizes: list[int] = Field(default_factory=lambda: [1000, 10000])
+    dimension: int = 256
+    query_count: int = Field(default=100, ge=10, le=500)
+    seed: int = 20260813
+
+
+class InfraBudgetUpdate(BaseModel):
+    max_api_requests_per_run: int = Field(default=500, ge=1, le=10000)
+    max_embedding_input_characters: int = Field(default=5_000_000, ge=1000, le=100_000_000)
+    allow_multi_model_rebuild: bool = True
+
+
+def _infra_budget() -> dict:
+    default = {
+        "max_api_requests_per_run": 500,
+        "max_embedding_input_characters": 5_000_000,
+        "allow_multi_model_rebuild": True,
+    }
+    matches = rows("SELECT value_json FROM app_settings WHERE key='infra_budget'")
+    if not matches:
+        return default
+    try:
+        return {**default, **json.loads(matches[0]["value_json"])}
+    except (TypeError, json.JSONDecodeError):
+        return default
+
+
+def _save_infra_budget(value: dict) -> dict:
+    with connect() as db:
+        db.execute(
+            """INSERT INTO app_settings(key,value_json,updated_at) VALUES('infra_budget',?,?)
+               ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at""",
+            (json_value(value), now()),
+        )
+    return _infra_budget()
+
+
 @app.get("/api/health")
 def health() -> dict:
     settings = get_settings()
@@ -160,6 +307,8 @@ def health() -> dict:
         "embedding_model": settings.embedding_model,
         "chat_ready": bool(settings.deepseek_api_key),
         "embedding_ready": bool(settings.dashscope_api_key),
+        "rerank_ready": bool(settings.dashscope_api_key and settings.dashscope_rerank_base_url),
+        "data_dir": str(settings.data_dir),
     }
 
 
@@ -178,7 +327,7 @@ def update_provider_key(provider: str, payload: ProviderKeyUpdate) -> dict:
 
 @app.post("/api/settings/providers/{provider}/test")
 def connect_provider(provider: str) -> dict:
-    if provider not in {"deepseek", "dashscope"}:
+    if provider not in {"deepseek", "dashscope", "dashscope-rerank"}:
         raise HTTPException(404, "未知模型提供方")
     result = test_provider(provider)
     if result["status"] != "connected":
@@ -397,6 +546,23 @@ def update_privacy(payload: PrivacySettingsUpdate) -> dict:
             "sensitive_memory": "不自动保存密码、验证码、银行卡、手机号或精确住址",
         },
     }
+
+
+@app.get("/api/settings/privacy/documents")
+def get_document_cloud_policies(space_id: str = "ai-agent-learning") -> list[dict]:
+    return document_cloud_policies(space_id)
+
+
+@app.put("/api/settings/privacy/documents/{document_id}")
+def update_document_cloud_policy(document_id: str, payload: DocumentCloudPolicyUpdate) -> dict:
+    try:
+        return save_document_cloud_policy(
+            document_id,
+            embedding_allowed=payload.embedding_allowed,
+            llm_allowed=payload.llm_allowed,
+        )
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
 
 
 @app.get("/api/tools")
@@ -682,9 +848,12 @@ def _embed_batch(texts: list[str]) -> list[list[float]]:
     return DashScopeEmbeddings().encode(texts)
 
 
-def _run_index_job(job_id: str, document_id: str, library_path: str) -> None:
+def _run_index_job(job_id: str, document_id: str, library_path: str, context: JobContext | None = None) -> None:
     settings = get_settings()
     try:
+        if context:
+            context.check_cancelled()
+            context.update(progress=2, phase="parsing", message="正在解析文档结构")
         _update_index_job(job_id, status="running", phase="parsing", progress=2, message="正在解析文档结构")
         if Path(library_path).suffix.lower() in IMAGE_TYPES:
             _update_index_job(job_id, phase="vision", progress=10, total=1, message="正在识别图片内容和文字")
@@ -709,6 +878,9 @@ def _run_index_job(job_id: str, document_id: str, library_path: str) -> None:
             )
 
         chunks = chunk_sections(parse_document(Path(library_path), parsing_progress))
+        if context:
+            context.check_cancelled()
+            context.update(progress=5, phase="lexical", message="正在建立 BM25 索引")
         total = len(chunks)
         stamp = now()
         _update_index_job(job_id, phase="lexical", progress=5, total=total, message=f"正在建立本地关键词索引，共 {total} 个 Chunk")
@@ -728,10 +900,12 @@ def _run_index_job(job_id: str, document_id: str, library_path: str) -> None:
             db.execute("UPDATE documents SET index_status=?,updated_at=? WHERE id=?", ("lexical_ready", now(), document_id))
 
         provider = DashScopeEmbeddings()
-        if not provider.available or not chunk_rows:
+        if not provider.available or not chunk_rows or document_id not in allowed_for_cloud([document_id], "embedding"):
             with connect() as db:
                 db.execute("UPDATE documents SET index_status=?,updated_at=? WHERE id=?", ("ready", now(), document_id))
             _update_index_job(job_id, status="completed", phase="ready", progress=100, completed=total, message="本地 BM25 索引已完成")
+            if context:
+                context.update(progress=100, phase="ready", message="本地 BM25 索引已完成")
             return
 
         cached: dict[str, str] = {}
@@ -763,9 +937,17 @@ def _run_index_job(job_id: str, document_id: str, library_path: str) -> None:
             job_id, phase="embedding", progress=max(8, int(completed / max(total, 1) * 100)),
             completed=completed, message=f"正在生成语义向量：{completed} / {total}",
         )
+        if context:
+            context.update(
+                progress=max(8, int(completed / max(total, 1) * 100)),
+                phase="embedding",
+                message=f"正在生成语义向量：{completed} / {total}",
+            )
         with ThreadPoolExecutor(max_workers=EMBEDDING_WORKERS, thread_name_prefix="kun-embedding") as pool:
             future_batches = {pool.submit(_embed_batch, [item[1].text for item in batch]): batch for batch in batches}
             for future in as_completed(future_batches):
+                if context:
+                    context.check_cancelled()
                 batch = future_batches[future]
                 vectors = future.result()
                 with connect() as db:
@@ -784,14 +966,23 @@ def _run_index_job(job_id: str, document_id: str, library_path: str) -> None:
                     job_id, progress=min(99, max(8, int(completed / max(total, 1) * 100))),
                     completed=completed, message=f"正在生成语义向量：{completed} / {total}",
                 )
+                if context:
+                    context.update(
+                        progress=min(99, max(8, int(completed / max(total, 1) * 100))),
+                        phase="embedding",
+                        message=f"正在生成语义向量：{completed} / {total}",
+                    )
 
         with connect() as db:
             db.execute("UPDATE documents SET index_status=?,updated_at=? WHERE id=?", ("ready", now(), document_id))
         _update_index_job(job_id, status="completed", phase="ready", progress=100, completed=total, message="文档索引已完成，可以开始提问")
+        if context:
+            context.update(progress=100, phase="ready", message="文档索引已完成")
     except Exception as error:
         with connect() as db:
             db.execute("UPDATE documents SET index_status=?,updated_at=? WHERE id=?", ("failed", now(), document_id))
         _update_index_job(job_id, status="failed", phase="failed", message="建立索引失败", error_message=str(error)[:500])
+        raise
 
 
 @app.post("/api/documents/{document_id}/confirm", status_code=202)
@@ -835,7 +1026,11 @@ def confirm_document(document_id: str, payload: ConfirmDocument) -> dict:
         db.execute("DELETE FROM staged_documents WHERE id=?", (document_id,))
         db.execute("DELETE FROM staged_image_analysis WHERE document_id=?", (document_id,))
     source.unlink(missing_ok=True)
-    INDEX_EXECUTOR.submit(_run_index_job, job_id, document_id, str(destination))
+    INFRA_RUNNER.enqueue(
+        "index_document",
+        {"job_id": job_id, "document_id": document_id, "library_path": str(destination)},
+        idempotency_key=f"legacy-index:{job_id}",
+    )
     return {"id": document_id, "job_id": job_id, "title": payload.title, "status": "queued"}
 
 
@@ -854,7 +1049,11 @@ def reindex_document(document_id: str) -> dict:
                VALUES(?,?,?,?,?,?,?,?,?,?)""",
             (job_id, document_id, "queued", "queued", 0, 0, 0, "已加入重新索引队列", stamp, stamp),
         )
-    INDEX_EXECUTOR.submit(_run_index_job, job_id, document_id, document["library_path"])
+    INFRA_RUNNER.enqueue(
+        "index_document",
+        {"job_id": job_id, "document_id": document_id, "library_path": document["library_path"]},
+        idempotency_key=f"legacy-index:{job_id}",
+    )
     return {"id": document_id, "job_id": job_id, "status": "queued"}
 
 
@@ -878,6 +1077,12 @@ def get_chunk(chunk_id: str) -> dict:
            FROM chunks c JOIN documents d ON d.id=c.document_id WHERE c.id=?""",
         (chunk_id,),
     )
+    if not matches:
+        matches = rows(
+            """SELECT c.id,c.locator,c.heading,c.text,d.title,d.original_name
+               FROM index_generation_chunks c JOIN documents d ON d.id=c.document_id WHERE c.id=?""",
+            (chunk_id,),
+        )
     if not matches:
         raise HTTPException(404, "引用片段不存在")
     return matches[0]
@@ -1574,5 +1779,338 @@ def analyze_image(document_id: str) -> dict:
     matches = rows("SELECT id,file_type FROM documents WHERE id=?", (document_id,))
     if not matches or matches[0]["file_type"] not in {"png", "jpg", "jpeg"}:
         raise HTTPException(404, "图片资料不存在")
-    INDEX_EXECUTOR.submit(index_image_document, document_id)
+    INFRA_RUNNER.enqueue(
+        "analyze_image",
+        {"document_id": document_id},
+        idempotency_key=f"image-analysis:{document_id}:{uuid4().hex[:8]}",
+    )
     return {"document_id": document_id, "status": "queued"}
+
+
+def _index_document_handler(payload: dict, context: JobContext) -> dict:
+    _run_index_job(payload["job_id"], payload["document_id"], payload["library_path"], context)
+    return {"document_id": payload["document_id"], "legacy_job_id": payload["job_id"]}
+
+
+def _image_analysis_handler(payload: dict, context: JobContext) -> dict:
+    context.update(progress=10, phase="vision", message="正在识别图片内容")
+    index_image_document(payload["document_id"])
+    context.update(progress=100, phase="ready", message="图片分析已完成")
+    return {"document_id": payload["document_id"]}
+
+
+def _experiment_handler(payload: dict, context: JobContext) -> dict:
+    return run_experiment(payload["run_id"], context)
+
+
+def _performance_handler(payload: dict, context: JobContext) -> dict:
+    return run_performance_benchmark(payload["benchmark_id"], context)
+
+
+def _candidate_generation_handler(payload: dict, context: JobContext) -> dict:
+    return generate_candidate_cases(payload["dataset_id"], payload["count"], context)
+
+
+INFRA_RUNNER.register("index_document", _index_document_handler)
+INFRA_RUNNER.register("analyze_image", _image_analysis_handler)
+INFRA_RUNNER.register("build_index_generation", lambda payload, context: build_index_generation(payload["generation_id"], context))
+INFRA_RUNNER.register("run_experiment", _experiment_handler)
+INFRA_RUNNER.register("performance_benchmark", _performance_handler)
+INFRA_RUNNER.register("generate_eval_candidates", _candidate_generation_handler)
+
+
+@app.get("/api/infra/overview")
+def get_infra_overview() -> dict:
+    return {**infra_summary(), "providers": provider_statuses()}
+
+
+@app.get("/api/infra/budget")
+def get_infra_budget() -> dict:
+    return _infra_budget()
+
+
+@app.put("/api/infra/budget")
+def update_infra_budget(payload: InfraBudgetUpdate) -> dict:
+    return _save_infra_budget(payload.model_dump())
+
+
+@app.get("/api/infra/jobs")
+def get_infra_jobs(limit: int = 100) -> list[dict]:
+    return INFRA_RUNNER.list(limit)
+
+
+@app.get("/api/infra/jobs/{job_id}")
+def get_infra_job(job_id: str) -> dict:
+    item = INFRA_RUNNER.get(job_id)
+    if not item:
+        raise HTTPException(404, "任务不存在")
+    return item
+
+
+@app.post("/api/infra/jobs/{job_id}/cancel")
+def cancel_infra_job(job_id: str) -> dict:
+    item = INFRA_RUNNER.cancel(job_id)
+    if not item:
+        raise HTTPException(404, "任务不存在")
+    return item
+
+
+@app.post("/api/infra/jobs/{job_id}/retry")
+def retry_infra_job(job_id: str) -> dict:
+    item = INFRA_RUNNER.retry(job_id)
+    if not item:
+        raise HTTPException(404, "任务不存在")
+    return item
+
+
+@app.get("/api/infra/traces")
+def get_infra_traces(limit: int = 50, trace_type: str | None = None, status: str | None = None) -> list[dict]:
+    return list_traces(limit, trace_type, status)
+
+
+@app.get("/api/infra/traces/{trace_id}")
+def get_infra_trace(trace_id: str) -> dict:
+    item = trace_detail(trace_id)
+    if not item:
+        raise HTTPException(404, "Trace 不存在")
+    return item
+
+
+@app.get("/api/infra/index-generations")
+def get_index_generations(space_id: str | None = None) -> list[dict]:
+    return list_index_generations(space_id)
+
+
+@app.post("/api/infra/index-generations", status_code=201)
+def plan_index_generation(payload: IndexGenerationCreate) -> dict:
+    if not _infra_budget()["allow_multi_model_rebuild"]:
+        models = {item["model"] for item in list_index_generations(payload.space_id) if item["status"] in {"building", "ready"}}
+        if models and payload.model not in models:
+            raise HTTPException(409, "当前预算策略不允许在多个 Embedding 模型间重复建立索引")
+    try:
+        generation = create_index_generation(**payload.model_dump())
+        return {**generation, "estimate": estimate_index_generation(generation["id"])}
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.get("/api/infra/index-generations/{generation_id}")
+def get_index_generation_route(generation_id: str) -> dict:
+    item = get_index_generation(generation_id)
+    if not item:
+        raise HTTPException(404, "索引代次不存在")
+    return item
+
+
+@app.get("/api/infra/index-generations/{generation_id}/estimate")
+def estimate_index_generation_route(generation_id: str) -> dict:
+    try:
+        return estimate_index_generation(generation_id)
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+
+
+@app.post("/api/infra/index-generations/{generation_id}/build", status_code=202)
+def enqueue_index_generation_build(generation_id: str, payload: IndexBuildRequest) -> dict:
+    if payload.confirmation != "重建此索引":
+        raise HTTPException(409, "请输入“重建此索引”确认云端调用和本地索引写入")
+    generation = get_index_generation(generation_id)
+    if not generation:
+        raise HTTPException(404, "索引代次不存在")
+    estimate = generation["estimate"]
+    budget = _infra_budget()
+    if estimate["estimated_batches"] > budget["max_api_requests_per_run"]:
+        raise HTTPException(409, "预计 Embedding 请求批次超过单次预算上限")
+    if estimate["estimated_input_characters"] > budget["max_embedding_input_characters"]:
+        raise HTTPException(409, "预计发送字符数超过单次预算上限")
+    job = INFRA_RUNNER.enqueue(
+        "build_index_generation",
+        {"generation_id": generation_id},
+        idempotency_key=f"index-generation:{generation_id}",
+        max_attempts=3,
+        message="索引代次已加入构建队列",
+    )
+    return {"generation": generation, "job": job}
+
+
+@app.post("/api/infra/index-generations/{generation_id}/activate")
+def activate_index_generation_route(generation_id: str) -> dict:
+    try:
+        return activate_generation(generation_id)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.post("/api/infra/retrieval-duel")
+def retrieval_duel(payload: RetrievalDuelRequest) -> dict:
+    try:
+        left = pipeline_search(payload.question, payload.space_id, payload.left, trace_type="retrieval_duel")
+        right = pipeline_search(payload.question, payload.space_id, payload.right, trace_type="retrieval_duel")
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(409, str(error)) from error
+    left_rank = {item["id"]: index for index, item in enumerate(left["results"], 1)}
+    right_rank = {item["id"]: index for index, item in enumerate(right["results"], 1)}
+    movement = [
+        {
+            "chunk_id": chunk_id,
+            "left_rank": left_rank.get(chunk_id),
+            "right_rank": right_rank.get(chunk_id),
+            "delta": (left_rank.get(chunk_id) or 99) - (right_rank.get(chunk_id) or 99),
+        }
+        for chunk_id in sorted(set(left_rank) | set(right_rank), key=lambda value: right_rank.get(value, 99))
+    ]
+    return {"question": payload.question, "left": left, "right": right, "rank_movement": movement}
+
+
+@app.get("/api/eval/datasets")
+def get_eval_datasets(space_id: str | None = None) -> list[dict]:
+    return list_datasets(space_id)
+
+
+@app.post("/api/eval/datasets", status_code=201)
+def create_eval_dataset(payload: DatasetCreateRequest) -> dict:
+    try:
+        return create_dataset(payload.space_id, payload.name, payload.version)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.post("/api/eval/datasets/import-legacy", status_code=201)
+def import_eval_dataset(payload: DatasetImportRequest) -> dict:
+    try:
+        return import_legacy_dataset(payload.space_id, payload.name, payload.version)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.get("/api/eval/datasets/{dataset_id}")
+def get_eval_dataset(dataset_id: str) -> dict:
+    item = dataset_detail(dataset_id)
+    if not item:
+        raise HTTPException(404, "评测集不存在")
+    return item
+
+
+@app.get("/api/eval/datasets/{dataset_id}/candidate-estimate")
+def estimate_eval_candidates(dataset_id: str, count: int = 10) -> dict:
+    try:
+        return candidate_generation_estimate(dataset_id, max(1, min(count, 20)))
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+
+
+@app.post("/api/eval/datasets/{dataset_id}/generate-candidates", status_code=202)
+def enqueue_eval_candidates(dataset_id: str, payload: CandidateGenerateRequest) -> dict:
+    if payload.confirmation != "生成候选题":
+        raise HTTPException(409, "请输入“生成候选题”确认将所选资料片段发送给 DeepSeek")
+    try:
+        estimate = candidate_generation_estimate(dataset_id, payload.count)
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+    job = INFRA_RUNNER.enqueue(
+        "generate_eval_candidates",
+        {"dataset_id": dataset_id, "count": payload.count},
+        idempotency_key=f"candidate-generation:{dataset_id}:{uuid4().hex[:8]}",
+        message="候选题生成已加入队列",
+    )
+    return {"estimate": estimate, "job": job}
+
+
+@app.patch("/api/eval/datasets/{dataset_id}/cases/{case_id}")
+def update_eval_case(dataset_id: str, case_id: str, payload: EvalCaseUpdateRequest) -> dict:
+    try:
+        return update_dataset_case(dataset_id, case_id, payload.model_dump(exclude_none=True))
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+
+
+@app.get("/api/eval/experiments")
+def get_experiments(limit: int = 100) -> list[dict]:
+    return list_experiments(limit)
+
+
+@app.post("/api/eval/experiments", status_code=202)
+def enqueue_experiment(payload: ExperimentCreate) -> dict:
+    dataset = dataset_detail(payload.dataset_version_id)
+    if not dataset:
+        raise HTTPException(404, "评测集不存在")
+    accepted_cases = sum(item["status"] == "accepted" and (payload.split == "all" or item["split"] == payload.split) for item in dataset["cases"])
+    requests_per_case = int(payload.pipeline in {"dense", "hybrid", "hybrid_rerank"}) + int(payload.pipeline == "hybrid_rerank")
+    estimated_requests = accepted_cases * requests_per_case
+    if estimated_requests > _infra_budget()["max_api_requests_per_run"]:
+        raise HTTPException(409, f"预计 {estimated_requests} 次模型请求，超过单次预算上限")
+    try:
+        run_item = create_experiment_run(
+            payload.dataset_version_id,
+            payload.name,
+            payload.model_dump(exclude={"dataset_version_id", "name", "parent_run_id"}),
+            payload.parent_run_id,
+        )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    job = INFRA_RUNNER.enqueue(
+        "run_experiment",
+        {"run_id": run_item["id"]},
+        idempotency_key=f"experiment:{run_item['id']}",
+        message="评测实验已加入队列",
+    )
+    return {"experiment": run_item, "job": job}
+
+
+@app.get("/api/eval/experiments/{run_id}")
+def get_experiment(run_id: str) -> dict:
+    item = experiment_detail(run_id)
+    if not item:
+        raise HTTPException(404, "实验不存在")
+    return item
+
+
+@app.get("/api/eval/experiments/{run_id}/report")
+def export_experiment_report(run_id: str, format: str = "markdown") -> StreamingResponse:
+    try:
+        content, media_type = render_experiment_report(run_id, format)
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+    extension = "json" if format == "json" else "md"
+    return StreamingResponse(
+        iter([content.encode("utf-8")]),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="kun-experiment-{run_id[:8]}.{extension}"'},
+    )
+
+
+@app.post("/api/eval/compare")
+def compare_experiment_runs(payload: ExperimentCompareRequest) -> dict:
+    try:
+        return compare_experiments(payload.baseline_id, payload.candidate_id)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.get("/api/infra/performance-benchmarks")
+def get_performance_benchmarks(limit: int = 30) -> list[dict]:
+    return list_performance_benchmarks(limit)
+
+
+@app.post("/api/infra/performance-benchmarks", status_code=202)
+def enqueue_performance_benchmark(payload: PerformanceBenchmarkCreate) -> dict:
+    try:
+        benchmark = create_performance_benchmark(payload.model_dump())
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    job = INFRA_RUNNER.enqueue(
+        "performance_benchmark",
+        {"benchmark_id": benchmark["id"]},
+        idempotency_key=f"performance:{benchmark['id']}",
+        message="性能压测已加入队列",
+    )
+    return {"benchmark": benchmark, "job": job}
+
+
+@app.get("/api/infra/performance-benchmarks/{benchmark_id}")
+def get_performance_benchmark(benchmark_id: str) -> dict:
+    item = performance_detail(benchmark_id)
+    if not item:
+        raise HTTPException(404, "性能压测不存在")
+    return item
+    generate_candidate_cases,

@@ -35,6 +35,12 @@ CREATE TABLE IF NOT EXISTS documents (
   parse_status TEXT NOT NULL, index_status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_document_fingerprint_space ON documents(fingerprint, space_id);
+CREATE TABLE IF NOT EXISTS document_cloud_policies (
+  document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+  embedding_allowed INTEGER NOT NULL DEFAULT 0,
+  llm_allowed INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS chunks (
   id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
   ordinal INTEGER NOT NULL, locator TEXT NOT NULL, heading TEXT, text TEXT NOT NULL,
@@ -138,6 +144,99 @@ CREATE TABLE IF NOT EXISTS evaluation_runs (
   result_json TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_evaluation_runs_space ON evaluation_runs(space_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS infra_traces (
+  id TEXT PRIMARY KEY, trace_type TEXT NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL,
+  root_attributes_json TEXT NOT NULL DEFAULT '{}', error_code TEXT,
+  started_at TEXT NOT NULL, finished_at TEXT, duration_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_infra_traces_started ON infra_traces(started_at DESC);
+CREATE TABLE IF NOT EXISTS infra_spans (
+  id TEXT PRIMARY KEY, trace_id TEXT NOT NULL REFERENCES infra_traces(id) ON DELETE CASCADE,
+  parent_span_id TEXT, operation TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,
+  attributes_json TEXT NOT NULL DEFAULT '{}', error_code TEXT,
+  started_at TEXT NOT NULL, finished_at TEXT, duration_ms REAL
+);
+CREATE INDEX IF NOT EXISTS idx_infra_spans_trace ON infra_spans(trace_id, started_at);
+CREATE TABLE IF NOT EXISTS infra_jobs (
+  id TEXT PRIMARY KEY, job_type TEXT NOT NULL, status TEXT NOT NULL,
+  payload_json TEXT NOT NULL, result_summary_json TEXT NOT NULL DEFAULT '{}',
+  idempotency_key TEXT, worker_id TEXT, attempt INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3, progress INTEGER NOT NULL DEFAULT 0,
+  phase TEXT NOT NULL DEFAULT 'queued', message TEXT NOT NULL DEFAULT '', error_code TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+  heartbeat_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_infra_jobs_idempotency ON infra_jobs(idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_infra_jobs_status ON infra_jobs(status, updated_at DESC);
+CREATE TABLE IF NOT EXISTS embedding_vectors (
+  chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+  content_hash TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+  dimension INTEGER NOT NULL, embedding_json TEXT NOT NULL, created_at TEXT NOT NULL,
+  PRIMARY KEY(chunk_id,provider,model,dimension)
+);
+CREATE INDEX IF NOT EXISTS idx_embedding_vectors_lookup ON embedding_vectors(provider,model,dimension,content_hash);
+CREATE TABLE IF NOT EXISTS generation_embedding_vectors (
+  content_hash TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+  dimension INTEGER NOT NULL, embedding_json TEXT NOT NULL, created_at TEXT NOT NULL,
+  PRIMARY KEY(content_hash,provider,model,dimension)
+);
+CREATE TABLE IF NOT EXISTS index_generations (
+  id TEXT PRIMARY KEY, space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+  status TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 0,
+  provider TEXT NOT NULL, model TEXT NOT NULL, dimension INTEGER NOT NULL,
+  strategy TEXT NOT NULL, chunk_size INTEGER NOT NULL, chunk_overlap INTEGER NOT NULL,
+  parser_version TEXT NOT NULL, chunker_version TEXT NOT NULL, config_hash TEXT NOT NULL,
+  manifest_path TEXT, vector_count INTEGER NOT NULL DEFAULT 0, index_bytes INTEGER NOT NULL DEFAULT 0,
+  error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, activated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_index_generations_space ON index_generations(space_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS index_generation_chunks (
+  id TEXT PRIMARY KEY, generation_id TEXT NOT NULL REFERENCES index_generations(id) ON DELETE CASCADE,
+  document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL, locator TEXT NOT NULL, heading TEXT, text TEXT NOT NULL,
+  content_hash TEXT NOT NULL, UNIQUE(generation_id,document_id,ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_generation_chunks_generation ON index_generation_chunks(generation_id,document_id,ordinal);
+CREATE VIRTUAL TABLE IF NOT EXISTS index_generation_chunks_fts USING fts5(
+  generation_id UNINDEXED, chunk_id UNINDEXED, text, tokenize='unicode61'
+);
+CREATE TABLE IF NOT EXISTS index_generation_items (
+  generation_id TEXT NOT NULL REFERENCES index_generations(id) ON DELETE CASCADE,
+  vector_id INTEGER NOT NULL, chunk_id TEXT NOT NULL,
+  PRIMARY KEY(generation_id,vector_id), UNIQUE(generation_id,chunk_id)
+);
+CREATE TABLE IF NOT EXISTS eval_dataset_versions (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+  status TEXT NOT NULL, source TEXT NOT NULL, content_hash TEXT NOT NULL,
+  case_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE(name,version,space_id)
+);
+CREATE TABLE IF NOT EXISTS eval_dataset_cases (
+  id TEXT PRIMARY KEY, dataset_version_id TEXT NOT NULL REFERENCES eval_dataset_versions(id) ON DELETE CASCADE,
+  question TEXT NOT NULL, split TEXT NOT NULL, query_type TEXT NOT NULL,
+  difficulty TEXT NOT NULL, status TEXT NOT NULL, gold_json TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_eval_dataset_cases_version ON eval_dataset_cases(dataset_version_id,status,split);
+CREATE TABLE IF NOT EXISTS experiment_runs (
+  id TEXT PRIMARY KEY, dataset_version_id TEXT NOT NULL REFERENCES eval_dataset_versions(id),
+  name TEXT NOT NULL, status TEXT NOT NULL, config_json TEXT NOT NULL, config_hash TEXT NOT NULL,
+  parent_run_id TEXT, git_revision TEXT NOT NULL, machine_json TEXT NOT NULL,
+  summary_json TEXT NOT NULL DEFAULT '{}', error_code TEXT,
+  created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_experiment_runs_created ON experiment_runs(created_at DESC);
+CREATE TABLE IF NOT EXISTS experiment_case_results (
+  run_id TEXT NOT NULL REFERENCES experiment_runs(id) ON DELETE CASCADE,
+  case_id TEXT NOT NULL REFERENCES eval_dataset_cases(id) ON DELETE CASCADE,
+  latency_ms REAL NOT NULL, metrics_json TEXT NOT NULL, rankings_json TEXT NOT NULL,
+  failure_category TEXT, trace_id TEXT, PRIMARY KEY(run_id,case_id)
+);
+CREATE TABLE IF NOT EXISTS performance_benchmarks (
+  id TEXT PRIMARY KEY, status TEXT NOT NULL, config_json TEXT NOT NULL,
+  result_json TEXT NOT NULL DEFAULT '{}', machine_json TEXT NOT NULL,
+  error_code TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT
+);
 """
 
 
