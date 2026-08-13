@@ -142,6 +142,18 @@ npm test
 - 配置正式联网搜索提供方，并将网页搜索证据接入带来源回答。
 - Tauri 系统托盘、全局快捷键、文件夹监控与 Windows 安装包。
 
+## Portfolio evidence workflow
+
+KUN's RAG lab stores each evaluation run with its dataset size, Top K, retrieval metrics, latency, and per-question results. Export a reproducible Markdown report after running an evaluation:
+
+```powershell
+python backend/scripts/export_evaluation_report.py --format markdown --output docs/evaluation/latest-report.md
+```
+
+The exporter also records the embedding/chat model names, machine profile, citation-location success rate, and bad cases. Treat the generated values as measured evidence only: do not describe them as production accuracy, and do not publish private source files or API keys.
+
+See `docs/portfolio/AGENT_CASE_STUDY.md` for the interview narrative and `docs/portfolio/DEMO_SCRIPT.md` for the three-minute walkthrough.
+
 ## License
 
 本项目目前未授予开源许可证。除非仓库后续明确添加许可证，否则保留全部权利。
