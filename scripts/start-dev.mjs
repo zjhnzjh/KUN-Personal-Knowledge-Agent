@@ -6,12 +6,13 @@ import { dirname, resolve } from "node:path";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-function run(command, args) {
+function run(command, args, environment = {}) {
   return spawn(command, args, {
     cwd: projectRoot,
     stdio: "inherit",
     windowsHide: true,
     shell: process.platform === "win32" && command.toLowerCase().endsWith(".cmd"),
+    env: { ...process.env, ...environment },
   });
 }
 
@@ -65,8 +66,14 @@ if (!existsSync(resolve(projectRoot, "node_modules"))) {
   await waitFor(run("npm.cmd", ["install", "--registry=https://registry.npmmirror.com"]));
 }
 
-console.log("KUN 正在启动本地 Agent 服务...");
-const backend = run("python", ["-m", "uvicorn", "backend.app.main:app", "--host", "127.0.0.1", "--port", "8765"]);
+const defaultDataDir = resolve(process.env.LOCALAPPDATA || projectRoot, "KUN-AI-Infra");
+const dataDir = process.env.KUN_DATA_DIR || defaultDataDir;
+console.log(`KUN 正在启动本地 Agent 服务：数据目录 ${dataDir}`);
+const backend = run(
+  "python",
+  ["-m", "uvicorn", "backend.app.main:app", "--host", "127.0.0.1", "--port", "8765"],
+  { KUN_DATA_DIR: dataDir },
+);
 const frontend = run("npm.cmd", ["run", "dev"]);
 
 let stopping = false;

@@ -56,6 +56,150 @@ def _dataset_hash(cases: list[dict[str, Any]]) -> str:
     return hashlib.sha256(json_value(stable).encode("utf-8")).hexdigest()
 
 
+def _case_validation(dataset: dict[str, Any], case: dict[str, Any], *, all_cases: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Run cheap, deterministic checks before a draft can become Gold."""
+    issues: list[str] = []
+    warnings: list[str] = []
+    question = str(case.get("question", "")).strip()
+    answer = str(case.get("answer", case.get("answer_text", ""))).strip()
+    gold = case.get("gold") or []
+    query_type = str(case.get("query_type", "")).strip()
+    is_no_answer = query_type == "no_answer"
+    if len(question) < 8:
+        issues.append("question_too_short")
+    if not gold and not is_no_answer:
+        issues.append("missing_gold_evidence")
+    document_ids = {item["id"] for item in rows("SELECT id FROM documents WHERE space_id=?", (dataset["space_id"],))}
+    missing_documents = [item.get("document_id") for item in gold if item.get("document_id") not in document_ids]
+    if missing_documents:
+        issues.append("gold_document_not_in_space")
+    if not answer:
+        if is_no_answer:
+            issues.append("missing_refusal_answer")
+        elif case.get("source_type") not in {"human", "legacy_import"}:
+            issues.append("missing_reference_answer")
+    existing = all_cases if all_cases is not None else dataset.get("cases", [])
+    normalized_question = " ".join(question.casefold().split())
+    duplicate = any(
+        item.get("id") != case.get("id")
+        and " ".join(str(item.get("question", "")).casefold().split()) == normalized_question
+        for item in existing
+    )
+    if duplicate:
+        issues.append("duplicate_question")
+    if len(gold) > 1:
+        warnings.append("multiple_gold_evidence")
+    return {
+        "valid": not issues,
+        "issues": issues,
+        "warnings": warnings,
+        "checked_at": now(),
+        "validator": "kun-eval-validator-v1",
+    }
+
+
+def _refresh_dataset(dataset_id: str) -> None:
+    raw_cases = rows("SELECT * FROM eval_dataset_cases WHERE dataset_version_id=? ORDER BY id", (dataset_id,))
+    cases = []
+    for item in raw_cases:
+        cases.append({
+            "id": item["id"], "question": item["question"], "split": item["split"],
+            "gold": json.loads(item["gold_json"] or "[]"),
+        })
+    accepted = sum(item["status"] == "accepted" for item in raw_cases)
+    dataset_row = rows("SELECT target_case_count,holdout_count FROM eval_dataset_versions WHERE id=?", (dataset_id,))
+    target_case_count = int(dataset_row[0]["target_case_count"] if dataset_row else 100)
+    holdout_count = int(dataset_row[0]["holdout_count"] if dataset_row else 30)
+    formal_ready = int(
+        accepted >= target_case_count
+        and sum(item["split"] == "holdout" and item["status"] == "accepted" for item in raw_cases) == holdout_count
+    )
+    with connect() as db:
+        db.execute(
+            "UPDATE eval_dataset_versions SET content_hash=?,case_count=?,formal_ready=?,status=?,updated_at=? WHERE id=?",
+            (_dataset_hash(cases), len(cases), formal_ready, "ready" if accepted else "draft", now(), dataset_id),
+        )
+
+
+def _stratified_split(dataset_id: str, holdout_count: int = 30, seed: int = 20260814) -> dict[str, Any]:
+    """Assign accepted cases to a deterministic 70/30 holdout split."""
+    dataset = dataset_detail(dataset_id)
+    if not dataset:
+        raise ValueError("Evaluation dataset does not exist")
+    accepted = [item for item in dataset["cases"] if item["status"] == "accepted"]
+    if len(accepted) < holdout_count:
+        raise ValueError(f"At least {holdout_count} accepted cases are required for a holdout split")
+    ranked = sorted(
+        accepted,
+        key=lambda item: hashlib.sha256(f"{seed}:{item['id']}".encode("utf-8")).hexdigest(),
+    )
+    holdout_ids = {item["id"] for item in ranked[:holdout_count]}
+    with connect() as db:
+        db.executemany(
+            "UPDATE eval_dataset_cases SET split=?,updated_at=? WHERE id=? AND dataset_version_id=? AND status='accepted'",
+            [("holdout" if item["id"] in holdout_ids else "dev", now(), item["id"], dataset_id) for item in accepted],
+        )
+        db.execute(
+            "UPDATE eval_dataset_versions SET holdout_count=?,split_seed=?,updated_at=? WHERE id=?",
+            (holdout_count, seed, now(), dataset_id),
+        )
+    _refresh_dataset(dataset_id)
+    refreshed = dataset_detail(dataset_id) or {}
+    return {
+        "dataset_id": dataset_id,
+        "accepted_count": sum(item["status"] == "accepted" for item in refreshed.get("cases", [])),
+        "dev_count": sum(item["status"] == "accepted" and item["split"] == "dev" for item in refreshed.get("cases", [])),
+        "holdout_count": sum(item["status"] == "accepted" and item["split"] == "holdout" for item in refreshed.get("cases", [])),
+        "formal_ready": bool(refreshed.get("formal_ready")),
+    }
+
+
+def dataset_readiness(dataset_id: str) -> dict[str, Any]:
+    dataset = dataset_detail(dataset_id)
+    if not dataset:
+        raise ValueError("Evaluation dataset does not exist")
+    cases = dataset.get("cases", [])
+    accepted = [item for item in cases if item["status"] == "accepted"]
+    source_documents = {gold.get("document_id") for item in accepted for gold in item.get("gold", []) if gold.get("document_id")}
+    accepted_types = {item["query_type"] for item in accepted}
+    checks = [
+        {"name": "accepted_gold_count", "required": dataset.get("target_case_count", 100), "actual": len(accepted), "passed": len(accepted) >= dataset.get("target_case_count", 100)},
+        {"name": "source_document_count", "required": 3, "actual": len(source_documents), "passed": len(source_documents) >= 3},
+        {"name": "query_type_coverage", "required": 5, "actual": len(accepted_types), "passed": len(accepted_types) >= 5},
+        {"name": "holdout_count", "required": dataset.get("holdout_count", 30), "actual": dataset.get("splits", {}).get("holdout", 0), "passed": dataset.get("splits", {}).get("holdout", 0) == dataset.get("holdout_count", 30)},
+    ]
+    return {
+        "dataset_id": dataset_id,
+        "name": dataset["name"],
+        "version": dataset["version"],
+        "accepted_count": len(accepted),
+        "draft_count": sum(item["status"] == "draft" for item in cases),
+        "rejected_count": sum(item["status"] == "rejected" for item in cases),
+        "dev_count": dataset.get("splits", {}).get("dev", 0),
+        "holdout_count": dataset.get("splits", {}).get("holdout", 0),
+        "source_document_count": len(source_documents),
+        "query_types": dataset.get("case_mix", {}),
+        "checks": checks,
+        "formal_ready": bool(dataset.get("formal_ready")),
+        "next_actions": [
+            check["name"] for check in checks if not check["passed"]
+        ],
+    }
+
+
+def finalize_dataset(dataset_id: str, holdout_count: int = 30, seed: int = 20260814) -> dict[str, Any]:
+    readiness = dataset_readiness(dataset_id)
+    if readiness["accepted_count"] < 100:
+        raise ValueError(f"Formal benchmark requires 100 accepted Gold cases; currently {readiness['accepted_count']}")
+    dataset = dataset_detail(dataset_id)
+    source_documents = {gold.get("document_id") for item in dataset.get("cases", []) if item["status"] == "accepted" for gold in item.get("gold", []) if gold.get("document_id")}
+    if len(source_documents) < 3:
+        raise ValueError("Formal benchmark requires at least 3 source documents")
+    _stratified_split(dataset_id, holdout_count=holdout_count, seed=seed)
+    _refresh_dataset(dataset_id)
+    return dataset_readiness(dataset_id)
+
+
 def create_dataset(space_id: str, name: str, version: str) -> dict:
     if not rows("SELECT 1 ok FROM spaces WHERE id=?", (space_id,)):
         raise ValueError("Knowledge space does not exist")
@@ -77,17 +221,76 @@ def create_dataset(space_id: str, name: str, version: str) -> dict:
     return dataset_detail(dataset_id) or {}
 
 
+def _candidate_source_snippets(space_id: str, count: int) -> tuple[list[dict[str, Any]], set[str]]:
+    """Select candidate-generation context with document-level coverage.
+
+    Ordering all chunks by document id can accidentally fill the entire context
+    from one document. Sample a small quota per allowed document first, then use
+    remaining capacity for additional chunks. This keeps the generated draft set
+    useful for the multi-document benchmark.
+    """
+    target = max(12, min(count * 2, 120))
+    document_rows = rows("SELECT id FROM documents WHERE space_id=? ORDER BY id", (space_id,))
+    allowed_documents = allowed_for_cloud([item["id"] for item in document_rows], "llm")
+    per_document_source = max(12, math.ceil(target / max(len(allowed_documents), 1)) * 2)
+    raw: list[dict[str, Any]] = []
+    for document_id in sorted(allowed_documents):
+        raw.extend(rows(
+            """SELECT c.id,c.document_id,c.locator,c.text,d.title,d.fingerprint
+               FROM chunks c JOIN documents d ON d.id=c.document_id
+               WHERE d.id=? AND length(c.text)>=80 ORDER BY c.ordinal LIMIT ?""",
+            (document_id, per_document_source),
+        ))
+    candidates = [item for item in raw if item["document_id"] in allowed_documents]
+    if not candidates:
+        return [], allowed_documents
+    per_document = max(1, math.ceil(target / len(allowed_documents)))
+    selected: list[dict[str, Any]] = []
+    for document_id in sorted(allowed_documents):
+        selected.extend(
+            [item for item in candidates if item["document_id"] == document_id][:per_document]
+        )
+    selected_ids = {item["id"] for item in selected}
+    for item in candidates:
+        if len(selected) >= target:
+            break
+        if item["id"] not in selected_ids:
+            selected.append(item)
+            selected_ids.add(item["id"])
+    return selected[:target], allowed_documents
+
+
+def _parse_candidate_response(content: str) -> list[dict[str, Any]]:
+    """Accept strict JSON, fenced JSON, or JSON followed by short prose."""
+    text = str(content or "").strip()
+    if not text:
+        raise ValueError("DeepSeek returned an empty candidate response")
+    if text.startswith("```"):
+        text = "\n".join(line for line in text.splitlines() if not line.strip().startswith("```"))
+    if text.lstrip().lower().startswith("json"):
+        text = text.lstrip()[4:].lstrip(" :\n")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        start = text.find("{")
+        if start < 0:
+            start = text.find("[")
+        if start < 0:
+            raise ValueError("DeepSeek response did not contain a JSON object") from None
+        payload, _ = decoder.raw_decode(text[start:])
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict) and isinstance(payload.get("cases"), list):
+        return payload["cases"]
+    raise ValueError("DeepSeek response JSON did not contain a cases array")
+
+
 def candidate_generation_estimate(dataset_id: str, count: int) -> dict[str, Any]:
     dataset = dataset_detail(dataset_id)
     if not dataset:
         raise ValueError("Evaluation dataset does not exist")
-    snippets = rows(
-        """SELECT c.id,c.document_id,c.text FROM chunks c JOIN documents d ON d.id=c.document_id
-           WHERE d.space_id=? AND length(c.text)>=80 ORDER BY d.id,c.ordinal LIMIT ?""",
-        (dataset["space_id"], max(4, min(count * 2, 30))),
-    )
-    allowed_documents = allowed_for_cloud(list({item["document_id"] for item in snippets}), "llm")
-    snippets = [item for item in snippets if item["document_id"] in allowed_documents]
+    snippets, allowed_documents = _candidate_source_snippets(dataset["space_id"], count)
     characters = sum(min(len(item["text"]), 700) for item in snippets)
     return {
         "dataset_id": dataset_id,
@@ -102,6 +305,22 @@ def candidate_generation_estimate(dataset_id: str, count: int) -> dict[str, Any]
 
 
 def generate_candidate_cases(dataset_id: str, count: int, context: JobContext) -> dict[str, Any]:
+    # Large generations are intentionally serialized into small provider calls.
+    # This keeps reasoning-heavy models from exhausting the output budget and
+    # makes each successful batch independently recoverable in the trace store.
+    if count > 5:
+        results: list[dict[str, Any]] = []
+        remaining = count
+        while remaining > 0:
+            batch = min(5, remaining)
+            results.append(generate_candidate_cases(dataset_id, batch, context))
+            remaining -= batch
+        return {
+            "dataset_id": dataset_id,
+            "generated_count": sum(int(item.get("generated_count", 0)) for item in results),
+            "trace_ids": [item.get("trace_id") for item in results if item.get("trace_id")],
+            "batches": len(results),
+        }
     settings = get_settings()
     privacy = get_privacy_settings()
     if not settings.deepseek_api_key:
@@ -112,14 +331,7 @@ def generate_candidate_cases(dataset_id: str, count: int, context: JobContext) -
     dataset = dataset_detail(dataset_id)
     if not dataset:
         raise ValueError("Evaluation dataset does not exist")
-    snippets = rows(
-        """SELECT c.id,c.document_id,c.locator,c.text,d.title,d.fingerprint
-           FROM chunks c JOIN documents d ON d.id=c.document_id
-           WHERE d.space_id=? AND length(c.text)>=80 ORDER BY d.id,c.ordinal LIMIT ?""",
-        (dataset["space_id"], max(4, min(count * 2, 30))),
-    )
-    allowed_documents = allowed_for_cloud(list({item["document_id"] for item in snippets}), "llm")
-    snippets = [item for item in snippets if item["document_id"] in allowed_documents]
+    snippets, allowed_documents = _candidate_source_snippets(dataset["space_id"], count)
     if not snippets:
         raise ValueError("No document in this space is allowed for DeepSeek candidate generation")
     source_map = {item["id"]: item for item in snippets}
@@ -142,7 +354,12 @@ def generate_candidate_cases(dataset_id: str, count: int, context: JobContext) -
                 json={
                     "model": settings.deepseek_model,
                     "temperature": 0.2,
-                    "max_tokens": 2400,
+                    # Leave enough room for one JSON object per requested case;
+                    # the API may still return fewer cases, which remains a draft
+                    # and is never counted as accepted Gold automatically.
+                    # deepseek-v4-flash may spend a large portion of the budget
+                    # on reasoning before emitting the JSON answer.
+                    "max_tokens": max(6000, min(12000, estimate["requested_candidates"] * 500)),
                     "response_format": {"type": "json_object"},
                     "messages": [
                         {
@@ -167,18 +384,27 @@ def generate_candidate_cases(dataset_id: str, count: int, context: JobContext) -
             content = content.strip("`")
             if content.startswith("json"):
                 content = content[4:].lstrip()
-        generated = json.loads(content).get("cases", [])
+        generated = _parse_candidate_response(content)
         accepted: list[dict[str, Any]] = []
+        existing_questions = {
+            " ".join(str(item["question"]).casefold().split())
+            for item in dataset.get("cases", [])
+        }
         for item in generated:
-            source = source_map.get(str(item.get("source_id", "")))
             question = str(item.get("question", "")).strip()
-            if not source or len(question) < 2:
+            normalized_question = " ".join(question.casefold().split())
+            source_ids = item.get("source_ids") or [item.get("source_id")]
+            sources = [source_map.get(str(source_id)) for source_id in source_ids]
+            sources = [source for source in sources if source]
+            if not sources or len(question) < 8 or normalized_question in existing_questions:
                 continue
+            existing_questions.add(normalized_question)
             accepted.append({
                 "id": uuid4().hex,
                 "question": question[:1000],
                 "query_type": str(item.get("query_type", "fact"))[:40],
                 "difficulty": str(item.get("difficulty", "medium"))[:20],
+                "answer": str(item.get("answer", "")).strip()[:2000],
                 "gold": [{
                     "document_id": source["document_id"],
                     "source_fingerprint": source["fingerprint"],
@@ -186,7 +412,7 @@ def generate_candidate_cases(dataset_id: str, count: int, context: JobContext) -
                     "locator": source["locator"],
                     "text_hash": hashlib.sha256(source["text"].encode("utf-8")).hexdigest(),
                     "relevance": 3,
-                }],
+                } for source in sources],
             })
             if len(accepted) >= estimate["requested_candidates"]:
                 break
@@ -194,20 +420,19 @@ def generate_candidate_cases(dataset_id: str, count: int, context: JobContext) -
         with connect() as db:
             db.executemany(
                 """INSERT INTO eval_dataset_cases(
-                   id,dataset_version_id,question,split,query_type,difficulty,status,gold_json,created_at,updated_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                   id,dataset_version_id,question,split,query_type,difficulty,status,gold_json,
+                   answer_text,source_type,validation_json,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 [
                     (
                         item["id"], dataset_id, item["question"], "dev", item["query_type"],
-                        item["difficulty"], "draft", json_value(item["gold"]), stamp, stamp,
+                        item["difficulty"], "draft", json_value(item["gold"]), item.get("answer", ""),
+                        "deepseek_candidate", json_value({"valid": False, "issues": ["human_review_required"]}), stamp, stamp,
                     )
                     for item in accepted
                 ],
             )
-            db.execute(
-                "UPDATE eval_dataset_versions SET case_count=(SELECT COUNT(*) FROM eval_dataset_cases WHERE dataset_version_id=?),updated_at=? WHERE id=?",
-                (dataset_id, stamp, dataset_id),
-            )
+        _refresh_dataset(dataset_id)
         context.update(progress=100, phase="draft_ready", message="候选题已生成，等待人工确认")
         finish_trace(trace_id, duration_ms=round((perf_counter() - started) * 1000), attributes={
             "generated_count": len(accepted), "status": "draft",
@@ -223,30 +448,173 @@ def update_dataset_case(dataset_id: str, case_id: str, patch: dict[str, Any]) ->
     if not matches:
         raise ValueError("Evaluation case does not exist")
     current = matches[0]
+    dataset = dataset_detail(dataset_id)
+    if not dataset:
+        raise ValueError("Evaluation dataset does not exist")
     status = patch.get("status", current["status"])
     if status not in {"draft", "accepted", "rejected"}:
         raise ValueError("Invalid evaluation case status")
     question = str(patch.get("question", current["question"])).strip()[:1000]
     gold = patch.get("gold")
     gold_json = json_value(gold) if isinstance(gold, list) else current["gold_json"]
+    answer = str(patch.get("answer", current["answer_text"])).strip()[:2000]
+    query_type = str(patch.get("query_type", current["query_type"])).strip()[:40] or "fact"
+    difficulty = str(patch.get("difficulty", current["difficulty"])).strip()[:20] or "medium"
+    split = str(patch.get("split", current["split"])).strip()
+    if split not in {"dev", "holdout"}:
+        raise ValueError("Case split must be dev or holdout")
+    case_for_validation = {
+        "id": case_id, "question": question, "answer": answer, "query_type": query_type,
+        "gold": json.loads(gold_json or "[]"), "source_type": current["source_type"],
+    }
+    other_cases = [item for item in dataset.get("cases", []) if item["id"] != case_id]
+    validation = _case_validation(dataset, case_for_validation, all_cases=other_cases)
+    if status == "accepted" and not validation["valid"]:
+        raise ValueError(f"Case failed validation: {', '.join(validation['issues'])}")
     with connect() as db:
         db.execute(
-            """UPDATE eval_dataset_cases SET question=?,status=?,gold_json=?,updated_at=?
+            """UPDATE eval_dataset_cases SET question=?,split=?,query_type=?,difficulty=?,status=?,gold_json=?,
+               answer_text=?,validation_json=?,updated_at=?
                WHERE id=? AND dataset_version_id=?""",
-            (question, status, gold_json, now(), case_id, dataset_id),
+            (question, split, query_type, difficulty, status, gold_json, answer, json_value(validation), now(), case_id, dataset_id),
         )
-        accepted = db.execute(
-            "SELECT COUNT(*) count FROM eval_dataset_cases WHERE dataset_version_id=? AND status='accepted'",
-            (dataset_id,),
-        ).fetchone()["count"]
-        total = db.execute(
-            "SELECT COUNT(*) count FROM eval_dataset_cases WHERE dataset_version_id=?", (dataset_id,)
-        ).fetchone()["count"]
-        db.execute(
-            "UPDATE eval_dataset_versions SET status=?,case_count=?,updated_at=? WHERE id=?",
-            ("ready" if accepted > 0 else "draft", total, now(), dataset_id),
-        )
+    _refresh_dataset(dataset_id)
     return dataset_detail(dataset_id) or {}
+
+
+def _auto_review_source(case: dict[str, Any]) -> str:
+    """Resolve the stored Gold chunk text used for an AI-assisted review."""
+    evidence: list[str] = []
+    for gold in case.get("gold") or []:
+        document_id = str(gold.get("document_id") or "")
+        if not document_id:
+            continue
+        source_rows = rows(
+            """SELECT c.locator,c.text,d.title FROM chunks c
+               JOIN documents d ON d.id=c.document_id
+               WHERE c.document_id=? AND length(c.text)>0 ORDER BY c.ordinal""",
+            (document_id,),
+        )
+        target_hash = str(gold.get("text_hash") or "")
+        target_locator = str(gold.get("locator") or "")
+        selected = next(
+            (item for item in source_rows if hashlib.sha256(item["text"].encode("utf-8")).hexdigest() == target_hash),
+            None,
+        )
+        if selected is None and target_locator:
+            selected = next((item for item in source_rows if item["locator"] == target_locator), None)
+        if selected is None and source_rows:
+            selected = source_rows[0]
+        if selected:
+            evidence.append(f"{selected['title']} / {selected['locator']}\n{selected['text'][:1800]}")
+    return "\n\n".join(evidence)
+
+
+def _parse_auto_review_response(content: str) -> list[dict[str, Any]]:
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:].lstrip()
+    payload = json.loads(cleaned)
+    if isinstance(payload, dict):
+        answers = payload.get("answers") or []
+        return answers if isinstance(answers, list) else []
+    return []
+
+
+def auto_accept_dataset_candidates(dataset_id: str, context: JobContext) -> dict[str, Any]:
+    """Use DeepSeek to fill and validate draft answers, then promote only supported cases."""
+    dataset = dataset_detail(dataset_id)
+    if not dataset:
+        raise ValueError("Evaluation dataset does not exist")
+    drafts = [item for item in dataset.get("cases", []) if item["status"] == "draft"]
+    if not drafts:
+        return {"dataset_id": dataset_id, "accepted_count": 0, "remaining_draft_count": 0, "failed_count": 0}
+    settings = get_settings()
+    if not settings.deepseek_api_key:
+        raise ValueError("DeepSeek API 未配置，无法自动补全参考答案")
+    trace_id = create_trace("dataset", "auto_accept_gold", {
+        "dataset_id": dataset_id, "draft_count": len(drafts), "model": settings.deepseek_model,
+    })
+    started = perf_counter()
+    accepted_count = 0
+    failed: list[dict[str, str]] = []
+    batch_size = 8
+    try:
+        for offset in range(0, len(drafts), batch_size):
+            context.check_cancelled()
+            batch = drafts[offset:offset + batch_size]
+            prompt_items = []
+            for item in batch:
+                evidence = _auto_review_source(item)
+                if not evidence:
+                    failed.append({"id": item["id"], "reason": "missing_source_text"})
+                    continue
+                prompt_items.append({"id": item["id"], "question": item["question"], "evidence": evidence})
+            if not prompt_items:
+                context.update(progress=min(95, round((offset + len(batch)) / len(drafts) * 100)), phase="auto_review", message="部分候选缺少可解析证据")
+                continue
+            with trace_span(trace_id, "deepseek_auto_review", "llm", attributes={
+                "model": settings.deepseek_model, "batch_size": len(prompt_items),
+            }) as span:
+                response = httpx.post(
+                    f"{settings.deepseek_base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {settings.deepseek_api_key}"},
+                    json={
+                        "model": settings.deepseek_model,
+                        "temperature": 0,
+                        "max_tokens": 3200,
+                        "response_format": {"type": "json_object"},
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "你是严格的检索评测集审核器。只能依据每题给出的 evidence 作答，不能补充常识。"
+                                    "如果 evidence 不足以回答，supported 必须为 false。返回 JSON："
+                                    "{\"answers\":[{\"id\":\"原样id\",\"supported\":true,\"answer\":\"简洁准确的标准答案\"}]}。"
+                                ),
+                            },
+                            {"role": "user", "content": json.dumps({"cases": prompt_items}, ensure_ascii=False)},
+                        ],
+                    },
+                    timeout=90,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                span.annotate(usage=payload.get("usage") or {})
+            answers = {str(item.get("id")): item for item in _parse_auto_review_response(payload["choices"][0]["message"]["content"])}
+            for item in batch:
+                review = answers.get(item["id"])
+                answer = str((review or {}).get("answer") or "").strip()
+                if not review or not bool(review.get("supported")) or not answer:
+                    failed.append({"id": item["id"], "reason": "evidence_not_sufficient"})
+                    continue
+                try:
+                    update_dataset_case(dataset_id, item["id"], {"status": "accepted", "answer": answer})
+                    validation_row = rows("SELECT validation_json FROM eval_dataset_cases WHERE id=?", (item["id"],))
+                    validation = json.loads(validation_row[0]["validation_json"] or "{}") if validation_row else {}
+                    validation.update({"review_mode": "ai_assisted_auto", "review_model": settings.deepseek_model})
+                    with connect() as db:
+                        db.execute("UPDATE eval_dataset_cases SET validation_json=? WHERE id=?", (json_value(validation), item["id"]))
+                    accepted_count += 1
+                except ValueError as error:
+                    failed.append({"id": item["id"], "reason": str(error)[:240]})
+            context.update(progress=min(95, round((offset + len(batch)) / len(drafts) * 100)), phase="auto_review", message=f"已自动审核 {min(offset + len(batch), len(drafts))}/{len(drafts)} 条")
+        refreshed = dataset_detail(dataset_id) or {}
+        remaining = sum(item["status"] == "draft" for item in refreshed.get("cases", []))
+        finish_trace(trace_id, duration_ms=round((perf_counter() - started) * 1000), attributes={
+            "accepted_count": accepted_count, "remaining_draft_count": remaining, "failed_count": len(failed),
+        })
+        context.update(progress=100, phase="auto_review_done", message=f"自动确认完成：{accepted_count} 条，保留 {remaining} 条待处理")
+        return {
+            "dataset_id": dataset_id, "accepted_count": accepted_count,
+            "remaining_draft_count": remaining, "failed_count": len(failed),
+            "failed": failed[:20], "trace_id": trace_id,
+        }
+    except Exception as error:
+        finish_trace(trace_id, "failed", duration_ms=round((perf_counter() - started) * 1000), error_code=type(error).__name__)
+        raise
 
 
 def import_legacy_dataset(space_id: str, name: str = "KUN Gold Set", version: str = "v1") -> dict:
@@ -295,16 +663,19 @@ def import_legacy_dataset(space_id: str, name: str = "KUN Gold Set", version: st
         db.execute("DELETE FROM eval_dataset_cases WHERE dataset_version_id=?", (dataset_id,))
         db.executemany(
             """INSERT INTO eval_dataset_cases(
-               id,dataset_version_id,question,split,query_type,difficulty,status,gold_json,created_at,updated_at
-               ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+               id,dataset_version_id,question,split,query_type,difficulty,status,gold_json,
+               answer_text,source_type,validation_json,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 (
                     f"{dataset_id}:{item['id']}", dataset_id, item["question"], item["split"],
-                    item["query_type"], item["difficulty"], item["status"], json_value(item["gold"]), stamp, stamp,
+                    item["query_type"], item["difficulty"], item["status"], json_value(item["gold"]), "",
+                    "human", json_value({"valid": True, "validator": "legacy_import"}), stamp, stamp,
                 )
                 for item in cases
             ],
         )
+    _refresh_dataset(dataset_id)
     return dataset_detail(dataset_id) or {}
 
 
@@ -330,11 +701,18 @@ def dataset_detail(dataset_id: str) -> dict | None:
     cases = rows("SELECT * FROM eval_dataset_cases WHERE dataset_version_id=? ORDER BY id", (dataset_id,))
     for item in cases:
         item["gold"] = json.loads(item.pop("gold_json") or "[]")
+        item["validation"] = json.loads(item.pop("validation_json") or "{}")
+        item["answer"] = item.pop("answer_text", "")
     dataset["cases"] = cases
     dataset["splits"] = {
-        "dev": sum(item["split"] == "dev" for item in cases),
-        "holdout": sum(item["split"] == "holdout" for item in cases),
+        "dev": sum(item["split"] == "dev" and item["status"] == "accepted" for item in cases),
+        "holdout": sum(item["split"] == "holdout" and item["status"] == "accepted" for item in cases),
     }
+    dataset["case_mix"] = {
+        key: sum(item["query_type"] == key and item["status"] == "accepted" for item in cases)
+        for key in sorted({item["query_type"] for item in cases})
+    }
+    dataset["source_documents"] = sorted({gold.get("title", "") for item in cases for gold in item["gold"] if gold.get("title")})
     return dataset
 
 
@@ -436,6 +814,18 @@ def _percentile(values: list[float], percentile: float) -> float:
     return round(float(ordered[index]), 2)
 
 
+def _bootstrap_ci(values: list[float], seed: int = 20260814, samples: int = 1000) -> list[float]:
+    if not values:
+        return [0.0, 0.0]
+    rng = random.Random(seed)
+    means = [
+        mean(values[rng.randrange(len(values))] for _ in values)
+        for _ in range(samples)
+    ]
+    means.sort()
+    return [round(means[24], 4), round(means[974], 4)]
+
+
 def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
     matches = rows("SELECT * FROM experiment_runs WHERE id=?", (run_id,))
     if not matches:
@@ -469,6 +859,10 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
         }
         doc_hits = {1: 0, 5: 0, 10: 0}
         evidence_hits = {1: 0, 5: 0, 10: 0}
+        case_metric_values = {
+            "document_recall": {1: [], 5: [], 10: []},
+            "evidence_recall": {1: [], 5: [], 10: []},
+        }
         stage_doc_hits: dict[str, dict[int, int]] = {}
         stage_evidence_hits: dict[str, dict[int, int]] = {}
         reciprocal_ranks: list[float] = []
@@ -477,6 +871,9 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
         citation_resolvable = 0
         failure_counts: dict[str, int] = {}
         type_totals: dict[str, list[int]] = {}
+        answerable_case_count = 0
+        no_answer_case_count = 0
+        no_answer_abstentions = 0
         for case_index, case in enumerate(cases, 1):
             context.check_cancelled()
             context.update(
@@ -485,9 +882,16 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
                 message=f"正在评测 {case_index} / {len(cases)}",
             )
             gold = json.loads(case["gold_json"] or "[]")
+            is_no_answer = case["query_type"] == "no_answer"
+            if is_no_answer:
+                no_answer_case_count += 1
+            else:
+                answerable_case_count += 1
             gold_documents = {item.get("document_id") for item in gold}
             result = pipeline_search(case["question"], dataset["space_id"], config, trace_type="evaluation_case")
             returned = result["results"]
+            if is_no_answer and not returned:
+                no_answer_abstentions += 1
             stage_results = result.get("stage_results", {})
             for stage_name, stage_items in stage_results.items():
                 if stage_name in {"final", "evaluation"} or not stage_items:
@@ -505,25 +909,35 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
             for key, value in result.get("api_stats", {}).items():
                 if key in api_totals:
                     api_totals[key] += int(value or 0)
-            citation_total += len(returned)
-            citation_resolvable += sum(bool(item.get("id") and item.get("locator")) for item in returned)
+            if not is_no_answer:
+                citation_total += len(returned)
+                citation_resolvable += sum(bool(item.get("id") and item.get("locator")) for item in returned)
             latencies.append(float(result["duration_ms"]))
             evaluation_items = stage_results.get("evaluation") or returned
             evaluation_relevances = [_relevance(item, gold) for item in evaluation_items]
             returned_relevances = [_relevance(item, gold) for item in returned]
             first_rank = next((index for index, relevance in enumerate(evaluation_relevances, 1) if relevance > 0), None)
             for k in (1, 5, 10):
-                if any(item.get("document_id") in gold_documents for item in evaluation_items[:k]):
-                    doc_hits[k] += 1
-                if any(value > 0 for value in evaluation_relevances[:k]):
-                    evidence_hits[k] += 1
-            reciprocal_ranks.append(1 / first_rank if first_rank else 0.0)
+                document_hit = any(item.get("document_id") in gold_documents for item in evaluation_items[:k])
+                evidence_hit = any(value > 0 for value in evaluation_relevances[:k])
+                if not is_no_answer:
+                    if document_hit:
+                        doc_hits[k] += 1
+                    if evidence_hit:
+                        evidence_hits[k] += 1
+                    case_metric_values["document_recall"][k].append(float(document_hit))
+                    case_metric_values["evidence_recall"][k].append(float(evidence_hit))
+            if not is_no_answer:
+                reciprocal_ranks.append(1 / first_rank if first_rank else 0.0)
             ideal = sorted([int(item.get("relevance", 3)) for item in gold], reverse=True)
             ideal_dcg = _dcg(ideal, 10)
             ndcg = _dcg(evaluation_relevances, 10) / ideal_dcg if ideal_dcg else 0.0
-            ndcgs.append(ndcg)
+            if not is_no_answer:
+                ndcgs.append(ndcg)
             document_found = any(item.get("document_id") in gold_documents for item in evaluation_items)
-            if first_rank:
+            if is_no_answer:
+                failure = "negative_query_not_abstained" if returned else None
+            elif first_rank:
                 failure = None
             elif document_found:
                 failure = "document_found_evidence_missed"
@@ -533,9 +947,10 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
                 failure = "empty_result"
             if failure:
                 failure_counts[failure] = failure_counts.get(failure, 0) + 1
-            type_bucket = type_totals.setdefault(case["query_type"], [0, 0])
-            type_bucket[1] += 1
-            type_bucket[0] += int(bool(first_rank))
+            if not is_no_answer:
+                type_bucket = type_totals.setdefault(case["query_type"], [0, 0])
+                type_bucket[1] += 1
+                type_bucket[0] += int(bool(first_rank))
             metrics = {
                 "document_hit": document_found,
                 "evidence_hit": bool(first_rank),
@@ -544,6 +959,8 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
                 "ndcg_10": round(ndcg, 6),
                 "evaluation_result_count": len(evaluation_items),
                 "context_result_count": len(returned),
+                "negative_case": is_no_answer,
+                "abstained": not returned if is_no_answer else None,
             }
             rankings = {
                 "gold": gold,
@@ -588,10 +1005,14 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
                     ),
                 )
         case_count = len(cases)
+        quality_denominator = max(answerable_case_count, 1)
         summary = {
             "case_count": case_count,
-            "document_recall": {str(k): round(doc_hits[k] / case_count, 4) for k in (1, 5, 10)},
-            "evidence_recall": {str(k): round(evidence_hits[k] / case_count, 4) for k in (1, 5, 10)},
+            "answerable_case_count": answerable_case_count,
+            "no_answer_case_count": no_answer_case_count,
+            "no_answer_abstention_rate": round(no_answer_abstentions / no_answer_case_count, 4) if no_answer_case_count else None,
+            "document_recall": {str(k): round(doc_hits[k] / quality_denominator, 4) for k in (1, 5, 10)},
+            "evidence_recall": {str(k): round(evidence_hits[k] / quality_denominator, 4) for k in (1, 5, 10)},
             "mrr": round(mean(reciprocal_ranks), 4),
             "ndcg_10": round(mean(ndcgs), 4),
             "citation_resolvable_rate": round(citation_resolvable / citation_total, 4) if citation_total else 0,
@@ -608,8 +1029,8 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
             },
             "stage_recall": {
                 stage: {
-                    "document_recall": {str(k): round(stage_doc_hits[stage][k] / case_count, 4) for k in (1, 5, 10)},
-                    "evidence_recall": {str(k): round(stage_evidence_hits[stage][k] / case_count, 4) for k in (1, 5, 10)},
+                    "document_recall": {str(k): round(stage_doc_hits[stage][k] / quality_denominator, 4) for k in (1, 5, 10)},
+                    "evidence_recall": {str(k): round(stage_evidence_hits[stage][k] / quality_denominator, 4) for k in (1, 5, 10)},
                 }
                 for stage in stage_doc_hits
             },
@@ -622,6 +1043,10 @@ def run_experiment(run_id: str, context: JobContext) -> dict[str, Any]:
                 for key, values in stage_latencies.items()
             },
             "api_stats": api_totals,
+            "confidence_intervals": {
+                metric: {str(k): _bootstrap_ci(values) for k, values in buckets.items()}
+                for metric, buckets in case_metric_values.items()
+            },
             "evaluation_scope": "accepted" if config.get("case_status", "accepted") == "accepted" else "exploratory",
             "dataset": {"name": dataset["name"], "version": dataset["version"], "content_hash": dataset["content_hash"]},
             "config": config,
@@ -671,6 +1096,45 @@ def experiment_detail(run_id: str) -> dict | None:
     return run
 
 
+def experiment_display_name(config: dict[str, Any], summary: dict[str, Any] | None = None, fallback: str = "") -> str:
+    """Return one stable, human-readable name without changing persisted run names."""
+    summary = summary or {}
+    pipeline = str(config.get("pipeline") or "bm25")
+    generation = config.get("index_snapshot") or {}
+    model = str(generation.get("model") or config.get("embedding_model") or "embedding")
+    dimension = generation.get("dimension") or config.get("dimension")
+    model_label = f"{model}/{dimension}d" if dimension else model
+    pipeline_labels = {
+        "bm25": "BM25 · 本地词法检索",
+        "dense": "Dense · 向量检索",
+        "hybrid": "Hybrid · BM25 + Dense + RRF",
+        "hybrid_rerank": "Hybrid + Rerank · RRF 后重排",
+    }
+    headline = pipeline_labels.get(pipeline, pipeline)
+    if pipeline != "bm25":
+        headline = f"{headline} · {model_label}"
+
+    details: list[str] = []
+    chunk_size = generation.get("chunk_size")
+    chunk_overlap = generation.get("chunk_overlap")
+    if chunk_size is not None and chunk_overlap is not None:
+        details.append(f"Chunk {chunk_size}/{chunk_overlap}")
+    strategy = generation.get("strategy")
+    if strategy:
+        details.append(str(strategy).upper())
+    details.append(f"cand {int(config.get('candidate_k', 20))}")
+    details.append(f"top {int(config.get('top_k', 10))}")
+    if pipeline in {"hybrid", "hybrid_rerank"}:
+        details.append(f"RRF {int(config.get('rrf_k', 60))}")
+    if pipeline == "hybrid_rerank":
+        details.append(f"rerank {int(config.get('reranker_top_n', 10))}")
+    case_count = summary.get("case_count")
+    if isinstance(case_count, (int, float)) and case_count > 0:
+        scope = "exploratory" if config.get("case_status") == "exploratory" else "Gold"
+        details.append(f"{int(case_count)} {scope}")
+    return " · ".join([headline, *details]) if details else (headline or fallback)
+
+
 def render_experiment_report(run_id: str, report_format: str = "markdown") -> tuple[str, str]:
     run = experiment_detail(run_id)
     if not run:
@@ -683,7 +1147,7 @@ def render_experiment_report(run_id: str, report_format: str = "markdown") -> tu
     dataset = rows("SELECT * FROM eval_dataset_versions WHERE id=?", (run["dataset_version_id"],))[0]
     bad_cases = [item for item in run.get("cases", []) if item.get("failure_category")]
     lines = [
-        f"# {run['name']}",
+        f"# {run.get('display_name') or run['name']}",
         "",
         "> This is a reproducible local evaluation report. It is not a production accuracy claim.",
         "",
@@ -692,9 +1156,10 @@ def render_experiment_report(run_id: str, report_format: str = "markdown") -> tu
         f"- Run ID: `{run['id']}`",
         f"- Status: `{run['status']}`",
         f"- Dataset: `{dataset['name']} {dataset['version']}` (`{dataset['content_hash']}`)",
-        f"- Accepted cases measured: {summary.get('case_count', 0)}",
+        f"- Cases measured: {summary.get('case_count', 0)} (answerable: {summary.get('answerable_case_count', summary.get('case_count', 0))}; no-answer: {summary.get('no_answer_case_count', 0)})",
         f"- Git revision: `{run['git_revision']}`",
         f"- Created at: {run['created_at']}",
+        f"- Original name: `{run['name']}`",
         f"- Machine: `{json.dumps(run['machine'], ensure_ascii=False, sort_keys=True)}`",
         f"- Config: `{json.dumps(run['config'], ensure_ascii=False, sort_keys=True)}`",
         "",
@@ -708,6 +1173,17 @@ def render_experiment_report(run_id: str, report_format: str = "markdown") -> tu
         f"- MRR: {summary.get('mrr', 0):.4f}",
         f"- nDCG@10: {summary.get('ndcg_10', 0):.4f}",
         f"- Citation resolvable rate: {summary.get('citation_resolvable_rate', 0):.4f}",
+        f"- No-answer abstention rate: {summary.get('no_answer_abstention_rate', 'n/a')}",
+        "",
+        "## 95% confidence intervals (paired bootstrap)",
+        "",
+    ]
+    for metric_name, label in (("evidence_recall", "Evidence Recall"), ("document_recall", "Document Recall")):
+        intervals = summary.get("confidence_intervals", {}).get(metric_name, {})
+        lines.append("- " + label + ": " + ", ".join(
+            f"@{k} [{value[0]:.4f}, {value[1]:.4f}]" for k, value in intervals.items()
+        ))
+    lines.extend([
         "",
         "## Retrieval latency",
         "",
@@ -718,7 +1194,7 @@ def render_experiment_report(run_id: str, report_format: str = "markdown") -> tu
         "",
         "## Bad cases",
         "",
-    ]
+    ])
     if not bad_cases:
         lines.append("No bad cases in this run.")
     else:
@@ -744,6 +1220,7 @@ def _decode_run(item: dict) -> dict:
     item["config"] = json.loads(item.pop("config_json") or "{}")
     item["machine"] = json.loads(item.pop("machine_json") or "{}")
     item["summary"] = json.loads(item.pop("summary_json") or "{}")
+    item["display_name"] = experiment_display_name(item["config"], item["summary"], item.get("name", ""))
     return item
 
 
@@ -810,8 +1287,8 @@ def compare_experiments(baseline_id: str, candidate_id: str) -> dict[str, Any]:
         "evidence_recall_delta_95_ci": [round(ci[24], 4), round(ci[974], 4)] if ci else [0, 0],
     }
     return {
-        "baseline": {"id": baseline_id, "name": baseline["name"], "config": baseline["config"]},
-        "candidate": {"id": candidate_id, "name": candidate["name"], "config": candidate["config"]},
+        "baseline": {"id": baseline_id, "name": baseline["name"], "display_name": baseline["display_name"], "config": baseline["config"]},
+        "candidate": {"id": candidate_id, "name": candidate["name"], "display_name": candidate["display_name"], "config": candidate["config"]},
         "status": "failed" if any(item["status"] == "failed" for item in checks) else "passed",
         "checks": checks,
         "confidence": confidence,
@@ -941,6 +1418,7 @@ def sweep_detail(sweep_id: str) -> dict[str, Any] | None:
     for item in item_rows:
         item["config"] = json.loads(item.pop("config_json") or "{}")
         item["summary"] = json.loads(item.pop("summary_json") or "{}")
+        item["display_name"] = experiment_display_name(item["config"], item["summary"], item.get("name", ""))
         item["status"] = item["run_status"] if item["run_status"] in {"succeeded", "running", "queued", "failed"} else item["status"]
         item.pop("run_status", None)
         items.append(item)

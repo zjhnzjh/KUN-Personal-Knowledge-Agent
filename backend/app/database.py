@@ -208,13 +208,17 @@ CREATE TABLE IF NOT EXISTS index_generation_items (
 CREATE TABLE IF NOT EXISTS eval_dataset_versions (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
   status TEXT NOT NULL, source TEXT NOT NULL, content_hash TEXT NOT NULL,
-  case_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  case_count INTEGER NOT NULL DEFAULT 0, target_case_count INTEGER NOT NULL DEFAULT 100,
+  holdout_count INTEGER NOT NULL DEFAULT 30, formal_ready INTEGER NOT NULL DEFAULT 0,
+  split_seed INTEGER NOT NULL DEFAULT 20260814, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   UNIQUE(name,version,space_id)
 );
 CREATE TABLE IF NOT EXISTS eval_dataset_cases (
   id TEXT PRIMARY KEY, dataset_version_id TEXT NOT NULL REFERENCES eval_dataset_versions(id) ON DELETE CASCADE,
   question TEXT NOT NULL, split TEXT NOT NULL, query_type TEXT NOT NULL,
   difficulty TEXT NOT NULL, status TEXT NOT NULL, gold_json TEXT NOT NULL,
+  answer_text TEXT NOT NULL DEFAULT '', source_type TEXT NOT NULL DEFAULT 'human',
+  validation_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_eval_dataset_cases_version ON eval_dataset_cases(dataset_version_id,status,split);
@@ -297,6 +301,23 @@ def init_database() -> None:
         message_columns = {row["name"] for row in db.execute("PRAGMA table_info(messages)").fetchall()}
         if "plan_json" not in message_columns:
             db.execute("ALTER TABLE messages ADD COLUMN plan_json TEXT NOT NULL DEFAULT '{}'")
+        dataset_columns = {row["name"] for row in db.execute("PRAGMA table_info(eval_dataset_versions)").fetchall()}
+        for column, definition in {
+            "target_case_count": "INTEGER NOT NULL DEFAULT 100",
+            "holdout_count": "INTEGER NOT NULL DEFAULT 30",
+            "formal_ready": "INTEGER NOT NULL DEFAULT 0",
+            "split_seed": "INTEGER NOT NULL DEFAULT 20260814",
+        }.items():
+            if column not in dataset_columns:
+                db.execute(f"ALTER TABLE eval_dataset_versions ADD COLUMN {column} {definition}")
+        case_columns = {row["name"] for row in db.execute("PRAGMA table_info(eval_dataset_cases)").fetchall()}
+        for column, definition in {
+            "answer_text": "TEXT NOT NULL DEFAULT ''",
+            "source_type": "TEXT NOT NULL DEFAULT 'human'",
+            "validation_json": "TEXT NOT NULL DEFAULT '{}'",
+        }.items():
+            if column not in case_columns:
+                db.execute(f"ALTER TABLE eval_dataset_cases ADD COLUMN {column} {definition}")
         legacy_citation_migration = "2026-07-25-remove-fixed-five-citations"
         applied = db.execute(
             "SELECT 1 FROM schema_migrations WHERE id=?",

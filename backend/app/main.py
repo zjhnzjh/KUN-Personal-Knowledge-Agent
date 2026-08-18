@@ -44,11 +44,14 @@ from .retrieval_engine import (
 from .experiments import (
     candidate_generation_estimate,
     compare_experiments,
+    auto_accept_dataset_candidates,
     create_dataset,
     create_experiment_run,
     create_experiment_sweep,
     create_performance_benchmark,
+    dataset_readiness,
     dataset_detail,
+    finalize_dataset,
     experiment_detail,
     generate_candidate_cases,
     import_legacy_dataset,
@@ -270,6 +273,15 @@ class EvalCaseUpdateRequest(BaseModel):
     question: str | None = Field(default=None, min_length=2, max_length=1000)
     status: str | None = Field(default=None, pattern=r"^(draft|accepted|rejected)$")
     gold: list[dict] | None = None
+    answer: str | None = Field(default=None, max_length=2000)
+    query_type: str | None = Field(default=None, max_length=40)
+    difficulty: str | None = Field(default=None, max_length=20)
+    split: str | None = Field(default=None, pattern=r"^(dev|holdout)$")
+
+
+class DatasetFinalizeRequest(BaseModel):
+    holdout_count: int = Field(default=30, ge=10, le=50)
+    seed: int = Field(default=20260814)
 
 
 class RetrievalDuelRequest(BaseModel):
@@ -1840,6 +1852,10 @@ def _candidate_generation_handler(payload: dict, context: JobContext) -> dict:
     return generate_candidate_cases(payload["dataset_id"], payload["count"], context)
 
 
+def _auto_accept_handler(payload: dict, context: JobContext) -> dict:
+    return auto_accept_dataset_candidates(payload["dataset_id"], context)
+
+
 INFRA_RUNNER.register("index_document", _index_document_handler)
 INFRA_RUNNER.register("analyze_image", _image_analysis_handler)
 INFRA_RUNNER.register("build_index_generation", lambda payload, context: build_index_generation(payload["generation_id"], context))
@@ -1847,6 +1863,7 @@ INFRA_RUNNER.register("run_experiment", _experiment_handler)
 INFRA_RUNNER.register("run_experiment_sweep", _experiment_sweep_handler)
 INFRA_RUNNER.register("performance_benchmark", _performance_handler)
 INFRA_RUNNER.register("generate_eval_candidates", _candidate_generation_handler)
+INFRA_RUNNER.register("auto_accept_eval_candidates", _auto_accept_handler)
 
 
 @app.get("/api/infra/overview")
@@ -1931,7 +1948,10 @@ def get_eval_model_catalog(space_id: str = "ai-agent-learning") -> dict:
             match["dimensions"].sort()
     return {
         "embedding": known_embeddings,
-        "reranker": [{"model": "qwen3-rerank", "provider": "dashscope", "dimensions": []}],
+        "reranker": [
+            {"model": "gte-rerank-v2", "provider": "dashscope", "dimensions": []},
+            {"model": "qwen3-rerank", "provider": "dashscope", "dimensions": []},
+        ],
         "custom_model_supported": True,
         "provider": "dashscope",
     }
@@ -2047,6 +2067,22 @@ def get_eval_dataset(dataset_id: str) -> dict:
     return item
 
 
+@app.get("/api/eval/datasets/{dataset_id}/readiness")
+def get_eval_dataset_readiness(dataset_id: str) -> dict:
+    try:
+        return dataset_readiness(dataset_id)
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+
+
+@app.post("/api/eval/datasets/{dataset_id}/finalize")
+def finalize_eval_dataset(dataset_id: str, payload: DatasetFinalizeRequest) -> dict:
+    try:
+        return finalize_dataset(dataset_id, payload.holdout_count, payload.seed)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+
+
 @app.get("/api/eval/datasets/{dataset_id}/candidate-estimate")
 def estimate_eval_candidates(dataset_id: str, count: int = 10) -> dict:
     try:
@@ -2070,6 +2106,23 @@ def enqueue_eval_candidates(dataset_id: str, payload: CandidateGenerateRequest) 
         message="候选题生成已加入队列",
     )
     return {"estimate": estimate, "job": job}
+
+
+@app.post("/api/eval/datasets/{dataset_id}/auto-accept", status_code=202)
+def enqueue_auto_accept_candidates(dataset_id: str) -> dict:
+    dataset = dataset_detail(dataset_id)
+    if not dataset:
+        raise HTTPException(404, "评测集不存在")
+    draft_count = sum(item["status"] == "draft" for item in dataset.get("cases", []))
+    if not draft_count:
+        raise HTTPException(409, "当前没有待自动确认的候选题")
+    job = INFRA_RUNNER.enqueue(
+        "auto_accept_eval_candidates",
+        {"dataset_id": dataset_id},
+        idempotency_key=f"auto-accept:{dataset_id}",
+        message=f"正在自动审核 {draft_count} 条候选题",
+    )
+    return {"draft_count": draft_count, "job": job}
 
 
 @app.patch("/api/eval/datasets/{dataset_id}/cases/{case_id}")

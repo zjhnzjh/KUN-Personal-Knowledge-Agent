@@ -184,3 +184,90 @@ def test_quality_experiment_keeps_gold_and_bad_case_metrics(monkeypatch, tmp_pat
     assert "Evidence Recall" in report
     assert "not a production accuracy claim" in report
     assert media_type.startswith("text/markdown")
+
+
+def test_experiment_display_name_explains_pipeline_without_changing_config():
+    from copy import deepcopy
+    from app.experiments import experiment_display_name
+
+    config = {
+        "pipeline": "hybrid_rerank",
+        "candidate_k": 20,
+        "top_k": 10,
+        "rrf_k": 60,
+        "reranker_top_n": 10,
+        "case_status": "accepted",
+        "index_snapshot": {
+            "model": "text-embedding-v4",
+            "dimension": 1024,
+            "chunk_size": 700,
+            "chunk_overlap": 120,
+            "strategy": "flat",
+        },
+    }
+    original = deepcopy(config)
+    display_name = experiment_display_name(config, {"case_count": 30}, "legacy name")
+
+    assert display_name == (
+        "Hybrid + Rerank · RRF 后重排 · text-embedding-v4/1024d · "
+        "Chunk 700/120 · FLAT · cand 20 · top 10 · RRF 60 · rerank 10 · 30 Gold"
+    )
+    assert "K=" not in display_name
+    assert "RRF 60" in display_name
+    assert config == original
+
+
+def test_gold_review_persists_answer_validation_and_readiness(monkeypatch, tmp_path: Path):
+    _prepare_database(monkeypatch, tmp_path)
+    space_id, document_id = _insert_space_and_document(tmp_path)
+    from app import experiments
+    from app.database import connect, json_value, now
+
+    dataset = experiments.create_dataset(space_id, "Gold Set 100", "v2")
+    case_id = "draft-case-1"
+    stamp = now()
+    gold = [{"document_id": document_id, "title": "Infra source", "locator": "Test", "relevance": 3}]
+    with connect() as db:
+        db.execute(
+            """INSERT INTO eval_dataset_cases(
+               id,dataset_version_id,question,split,query_type,difficulty,status,gold_json,
+               answer_text,source_type,validation_json,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (case_id, dataset["id"], "What does the document explain about observability?", "dev", "fact", "easy", "draft", json_value(gold), "It explains observability.", "test", "{}", stamp, stamp),
+        )
+
+    updated = experiments.update_dataset_case(dataset["id"], case_id, {"status": "accepted"})
+    assert updated["cases"][0]["answer"] == "It explains observability."
+    assert updated["cases"][0]["validation"]["valid"] is True
+    readiness = experiments.dataset_readiness(dataset["id"])
+    assert readiness["accepted_count"] == 1
+    assert readiness["formal_ready"] is False
+    assert "accepted_gold_count" in readiness["next_actions"]
+
+    duplicate_id = "draft-case-2"
+    with connect() as db:
+        db.execute(
+            """INSERT INTO eval_dataset_cases(
+               id,dataset_version_id,question,split,query_type,difficulty,status,gold_json,
+               answer_text,source_type,validation_json,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (duplicate_id, dataset["id"], "What does the document explain about observability?", "dev", "fact", "easy", "draft", json_value(gold), "Same answer.", "test", "{}", stamp, stamp),
+        )
+    try:
+        experiments.update_dataset_case(dataset["id"], duplicate_id, {"status": "accepted"})
+    except ValueError as error:
+        assert "duplicate_question" in str(error)
+    else:
+        raise AssertionError("duplicate Gold questions must not be accepted")
+
+    negative_id = "draft-case-negative"
+    with connect() as db:
+        db.execute(
+            """INSERT INTO eval_dataset_cases(
+               id,dataset_version_id,question,split,query_type,difficulty,status,gold_json,
+               answer_text,source_type,validation_json,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (negative_id, dataset["id"], "Which policy is not present in this source?", "dev", "no_answer", "medium", "draft", "[]", "The source does not contain that policy.", "test", "{}", stamp, stamp),
+        )
+    negative = experiments.update_dataset_case(dataset["id"], negative_id, {"status": "accepted"})
+    assert negative["cases"][-1]["query_type"] == "no_answer"

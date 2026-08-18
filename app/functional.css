@@ -475,3 +475,94 @@ button.space-card.selected-space{border-color:#a99ff2;box-shadow:0 0 0 3px #7063
 .sweep-panel{margin-bottom:14px}.sweep-list{display:flex;flex-direction:column}.sweep-list article{display:grid;grid-template-columns:minmax(180px,1fr) auto 70px;gap:10px;align-items:center;border-top:1px solid var(--line);padding:10px 0}.sweep-list article>div:first-child{display:flex;flex-direction:column}.sweep-list strong{font-size:9px}.sweep-list small{font-size:7px;color:#888;margin-top:3px}.sweep-list>b{font-size:8px;text-align:right}.sweep-progress{grid-column:1/-1;height:4px;background:#efeff4;border-radius:5px;overflow:hidden}.sweep-progress i{display:block;height:100%;background:#6b5bd5;border-radius:5px}
 .experiment-insights{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:14px}.experiment-insights>article{border:1px solid var(--line);border-radius:10px;padding:11px;background:#fbfaff;min-width:0}.experiment-insights>article>span{display:block;font-size:8px;color:#6b5fc2;font-weight:700;margin-bottom:9px}.stage-recall-row{display:flex;gap:7px;align-items:center;border-top:1px solid var(--line);padding:7px 0}.stage-recall-row>b{font-size:7px;min-width:90px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.stage-recall-row>span{display:flex;gap:4px;flex-wrap:wrap}.stage-recall-row i{font-style:normal;font-size:6px;background:#eeeaff;color:#6256bb;border-radius:4px;padding:3px 4px}.latency-breakdown-row{display:grid;grid-template-columns:80px 1fr auto;gap:6px;align-items:center;border-top:1px solid var(--line);padding:8px 0}.latency-breakdown-row>b{font-size:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.latency-breakdown-row>div{display:flex;height:9px;background:#efeff4;border-radius:4px;overflow:hidden}.latency-breakdown-row i{display:block;background:#7565d4;border-right:1px solid #fff}.latency-breakdown-row i:nth-child(2){background:#a28fe8}.latency-breakdown-row i:nth-child(3){background:#e2a665}.latency-breakdown-row i:nth-child(4){background:#68b8a0}.latency-breakdown-row i:nth-child(5){background:#d97980}.latency-breakdown-row small{font-size:7px;color:#888;white-space:nowrap}.pareto-chart{position:relative;height:135px;border-left:1px solid #cfcbe0;border-bottom:1px solid #cfcbe0;background:linear-gradient(transparent 24%,#eeeaf8 25%,transparent 26%,transparent 49%,#eeeaf8 50%,transparent 51%,transparent 74%,#eeeaf8 75%,transparent 76%)}.pareto-chart>i{position:absolute;width:9px;height:9px;border-radius:50%;background:#6556cf;box-shadow:0 0 0 3px #6556cf22}.pareto-chart>i em{position:absolute;left:12px;top:-3px;font-style:normal;font-size:6px;color:#67617b;white-space:nowrap}.pareto-chart .pareto-x{position:absolute;right:2px;bottom:-18px;font-size:6px;color:#888}.pareto-chart .pareto-y{position:absolute;left:-5px;top:-12px;font-size:6px;color:#888;transform:rotate(-90deg);transform-origin:left top}
 @media(max-width:1100px){.experiment-insights{grid-template-columns:1fr}.sweep-list article{grid-template-columns:minmax(160px,1fr) auto 55px}}
+.dataset-readiness-panel,.dataset-review-panel{margin-bottom:14px}.dataset-readiness-panel>header p,.dataset-review-panel>header p{font-size:8px;color:#888;margin:5px 0 0;line-height:1.5}.dataset-readiness-grid{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:10px;overflow:hidden;margin:12px 0}.dataset-readiness-grid>div{padding:12px;border-right:1px solid var(--line)}.dataset-readiness-grid>div:last-child{border:0}.dataset-readiness-grid strong,.dataset-readiness-grid span{display:block}.dataset-readiness-grid strong{font-size:18px}.dataset-readiness-grid span{font-size:7px;color:#888;margin-top:3px}.dataset-readiness-checks{display:flex;gap:6px;flex-wrap:wrap}.dataset-readiness-checks span{font-size:7px;border-radius:6px;padding:5px 7px;background:#f7f6f9;color:#777}.dataset-readiness-checks span.passed{background:#e8f7ee;color:#287653}.dataset-readiness-checks span.waiting{background:#fff4df;color:#8a6828}.dataset-readiness-checks i{font-style:normal;margin-right:4px}.dataset-readiness-panel>footer{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:12px}.dataset-readiness-panel>footer small{font-size:7px;color:#888}.dataset-review-list{display:flex;flex-direction:column}.dataset-review-list details{border-top:1px solid var(--line);padding:10px 0}.dataset-review-list summary{display:grid;grid-template-columns:25px 1fr auto;gap:8px;align-items:center;cursor:pointer}.dataset-review-list summary>span{font-size:7px;color:#888}.dataset-review-list summary strong{font-size:9px}.dataset-review-list summary small{font-size:7px;color:#888}.dataset-review-form{padding:10px 0 2px 25px}.dataset-review-form>label,.dataset-review-form>div>label{display:flex;flex-direction:column;gap:5px;font-size:7px;color:#777}.dataset-review-form>label{margin-bottom:9px}.dataset-review-form>label input,.dataset-review-form textarea,.dataset-review-form select{border:1px solid var(--line);background:#fff;border-radius:7px;padding:8px;font-size:8px}.dataset-review-form textarea{min-height:54px;resize:vertical}.dataset-review-form>div{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.dataset-gold-source{font-size:7px;color:#777;background:#faf9fd;border-radius:7px;padding:8px;line-height:1.5}.dataset-review-form>footer{display:flex;justify-content:flex-end;gap:6px}.dataset-review-form>footer button{border:1px solid var(--line);background:#fff;border-radius:7px;padding:7px 9px;font-size:8px}.dataset-review-form>footer .primary-button{border:0}.dataset-readiness-panel .infra-status.pending{background:#fff4df;color:#8a6828}
+
+/* AI Infra readability pass: keep the main product typography unchanged. */
+.infra-page .infra-tabs button{font-size:10px}
+.infra-page .infra-notice{font-size:10px}
+.infra-page .infra-panel header span,.infra-page .infra-builder header span,.infra-page .infra-pipeline header span,.infra-page .duel-controls>div>span,.infra-page .regression-verdict span{font-size:8px}
+.infra-page .infra-panel h2,.infra-page .infra-builder h2,.infra-page .infra-pipeline h2,.infra-page .duel-controls h2,.infra-page .regression-verdict h2{font-size:15px}
+.infra-page .infra-panel header p,.infra-page .infra-builder header p,.infra-page .infra-pipeline header p{font-size:9px}
+.infra-page .infra-panel header>b,.infra-page .infra-panel header button{font-size:9px}
+.infra-page .infra-job-list article>div>strong,.infra-page .infra-index-list article strong,.infra-page .dataset-list strong,.infra-page .experiment-table strong{font-size:10px}
+.infra-page .infra-job-list p,.infra-page .infra-index-list p,.infra-page .dataset-list small,.infra-page .experiment-table small{font-size:8px}
+.infra-page .experiment-history-caption{font-size:9px}
+.infra-page .experiment-history .experiment-history-actions button{font-size:9px}
+.infra-page .experiment-history-summary span,.infra-page .experiment-history-summary small{font-size:8px}
+.infra-page .experiment-history-head{font-size:9px}
+.infra-page .experiment-history-row{font-size:10px;padding-top:12px;padding-bottom:12px}
+.infra-page .experiment-run-name b{font-size:11px;line-height:1.35;white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.infra-page .experiment-run-name small{font-size:8px;line-height:1.4}
+.infra-page .experiment-history-row>strong{font-size:10px}
+.infra-page .link-button{font-size:9px}
+
+/* Keep the dataset selector compact while giving the experiment controls room. */
+@media(min-width:901px){.infra-two-columns.experiment-top{grid-template-columns:minmax(255px,.72fr) minmax(0,1.28fr)}}
+.infra-form-grid{grid-template-columns:1.35fr .7fr 1fr .8fr auto auto}
+.infra-form-grid .index-pair-button{white-space:nowrap;background:#6657d3;color:#fff;border:0}
+.index-pair-help{font-size:8px;color:#8a8794;margin:9px 0 0;line-height:1.5}
+.index-pair-progress{margin-top:12px;border:1px solid #e5e1f7;background:#fbfaff;border-radius:11px;padding:11px 12px}
+.index-pair-progress>header{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.index-pair-progress>header strong{font-size:9px}
+.index-pair-progress>header span{font-size:9px;color:#5f52c7;font-weight:700}
+.index-pair-progress>p{font-size:8px;color:#888;margin:7px 0}
+.index-pair-progress-track,.index-pair-progress-grid>div>div{height:6px;background:#eceaf3;border-radius:5px;overflow:hidden}
+.index-pair-progress-track{margin-top:9px}
+.index-pair-progress-track>i,.index-pair-progress-grid>div>div>i{display:block;height:100%;background:#6d5bd3;border-radius:5px;transition:width .3s ease}
+.index-pair-progress-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:10px}
+.index-pair-progress-grid>div{display:grid;grid-template-columns:1fr auto;gap:5px 8px;align-items:center}
+.index-pair-progress-grid>div>span{display:flex;flex-direction:column}
+.index-pair-progress-grid b{font-size:8px}
+.index-pair-progress-grid small{font-size:7px;color:#888}
+.index-pair-progress-grid>strong{font-size:8px;color:#5f52c7}
+.index-pair-progress-grid>div>div{grid-column:1/-1;height:5px}
+@media(max-width:1180px){.infra-form-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.infra-form-grid .index-pair-button{grid-column:span 2}}
+.infra-page .experiment-compare-context span,.infra-page .experiment-compare-cards article>span{font-size:8px}
+.infra-page .experiment-compare-context strong,.infra-page .experiment-compare-cards article>strong{font-size:11px}
+.infra-page .experiment-compare-context small,.infra-page .experiment-compare-cards article>small,.infra-page .experiment-compare-cards article>a{font-size:8px;line-height:1.45}
+.infra-page .experiment-matrix-head{font-size:8px}
+.infra-page .experiment-matrix-row>strong,.infra-page .experiment-matrix-row>span>b{font-size:9px}
+.infra-page .experiment-delta-list article b,.infra-page .experiment-delta-list article>strong{font-size:9px}
+.infra-page .experiment-delta-list article small{font-size:8px}
+.infra-page .experiment-insights>article>span{font-size:9px}
+.infra-page .stage-recall-row>b,.infra-page .latency-breakdown-row>b{font-size:8px}
+.infra-page .stage-recall-row i,.infra-page .latency-breakdown-row small{font-size:7px}
+.infra-page .trace-picker{font-size:9px}
+.infra-page .trace-picker select{font-size:9px}
+.infra-page .trace-picker-current strong{font-size:10px}
+.infra-page .trace-picker-current small,.infra-page .trace-picker-current>b{font-size:8px}
+.infra-page .span-waterfall strong{font-size:9px}
+.infra-page .span-waterfall small,.infra-page .trace-detail summary{font-size:8px}
+.infra-page .span-waterfall article>b{font-size:9px}
+.infra-page .experiment-controls label,.infra-page .duel-controls label,.infra-page .regression-config label{font-size:9px}
+.infra-page .experiment-controls select,.infra-page .experiment-controls input,.infra-page .duel-controls select,.infra-page .duel-controls input,.infra-page .regression-config select{font-size:10px}
+.infra-page .experiment-rule{font-size:9px;line-height:1.65}
+.infra-page .sweep-list strong{font-size:10px}
+.infra-page .sweep-list small{font-size:8px}
+
+/* Structured experiment configuration: Pipeline stays in its own column. */
+.infra-page .experiment-history-table{min-width:1260px}
+.infra-page .experiment-history-head,
+.infra-page .experiment-history-row{grid-template-columns:36px 48px minmax(340px,2.2fr) minmax(150px,1fr) .8fr .65fr .75fr .8fr .7fr 44px}
+.infra-page .experiment-run-name{align-items:flex-start;gap:5px}
+.infra-page .experiment-run-name b{display:block;font-size:11px;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.infra-page .experiment-run-name small{font-size:8px;color:#8a8893;line-height:1.35}
+.infra-page .experiment-config-chips{display:flex;flex-wrap:wrap;gap:4px;width:100%;margin-top:1px}
+.infra-page .experiment-config-chips i{display:inline-flex;align-items:center;gap:4px;padding:4px 6px;border:1px solid #e6e2f5;border-radius:6px;background:#faf9ff;color:#5e55a8;font-size:8px;font-style:normal;line-height:1.1;white-space:nowrap}
+.infra-page .experiment-config-chips em{color:#9993b8;font-size:7px;font-style:normal}
+.infra-page .experiment-config-chips strong{color:#4b438f;font-size:8px;font-weight:700}
+.infra-page .experiment-pipeline-cell{display:flex;flex-direction:column;gap:4px;min-width:0}
+.infra-page .experiment-pipeline-cell b{font-size:10px;line-height:1.25;white-space:nowrap}
+.infra-page .experiment-pipeline-cell small{color:#8a8893;font-size:8px;line-height:1.35}
+.infra-page .experiment-compare-cards .experiment-config-chips{margin:9px 0}
+.infra-page .experiment-compare-cards .compare-pipeline-label{color:#5e55a8;font-weight:650}
+.infra-page .experiment-parameter-guide{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-top:12px}
+.infra-page .experiment-parameter-guide span{display:flex;align-items:center;gap:7px;min-width:0;padding:7px 8px;border:1px solid #ebe8f5;border-radius:8px;background:#fbfaff}
+.infra-page .experiment-parameter-guide b{color:#5e55bd;font-size:9px;white-space:nowrap}
+.infra-page .experiment-parameter-guide small{color:#8b8897;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+@media(max-width:1100px){
+  .infra-page .experiment-history-table{min-width:1180px}
+  .infra-page .experiment-history-head,
+  .infra-page .experiment-history-row{grid-template-columns:32px 44px minmax(300px,2fr) minmax(130px,.9fr) .8fr .65fr .75fr .8fr .7fr 40px}
+}
+@media(max-width:700px){.infra-page .experiment-parameter-guide{grid-template-columns:repeat(2,minmax(0,1fr))}}

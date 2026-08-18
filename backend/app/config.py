@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .credentials import get_secret
 
@@ -22,6 +23,18 @@ class Settings:
     vision_model: str
 
 
+def rerank_endpoint_url(settings: Settings, model: str | None = None) -> str:
+    """Return the correct Beijing Rerank endpoint for a Bailian model.
+
+    qwen3-rerank exposes the OpenAI-compatible route, while gte-rerank-v2
+    uses the DashScope service route on the same workspace host.
+    """
+    if model == "gte-rerank-v2":
+        parsed = urlsplit(settings.dashscope_rerank_base_url)
+        return f"{parsed.scheme}://{parsed.netloc}/api/v1/services/rerank/text-rerank/text-rerank"
+    return f"{settings.dashscope_rerank_base_url}/reranks"
+
+
 def get_settings() -> Settings:
     configured = os.getenv("KUN_DATA_DIR", "").strip()
     local = os.getenv("LOCALAPPDATA", str(Path.home()))
@@ -36,7 +49,12 @@ def get_settings() -> Settings:
         dashscope_base_url=os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").rstrip("/"),
         embedding_model=os.getenv("DASHSCOPE_EMBEDDING_MODEL", "qwen3.7-text-embedding"),
         embedding_dimension=int(os.getenv("DASHSCOPE_EMBEDDING_DIMENSION", "1024")),
-        dashscope_rerank_base_url=os.getenv("DASHSCOPE_RERANK_BASE_URL", "https://dashscope.aliyuncs.com/compatible-api/v1").rstrip("/"),
-        rerank_model=os.getenv("DASHSCOPE_RERANK_MODEL", "qwen3-rerank"),
+        # Bailian Rerank uses the Beijing workspace endpoint. Keep it
+        # configurable so another workspace can override it.
+        dashscope_rerank_base_url=os.getenv(
+            "DASHSCOPE_RERANK_BASE_URL",
+            "https://ws-w4iy4yyuv17espj8.cn-beijing.maas.aliyuncs.com/compatible-api/v1",
+        ).rstrip("/"),
+        rerank_model=os.getenv("DASHSCOPE_RERANK_MODEL", "gte-rerank-v2"),
         vision_model=os.getenv("DASHSCOPE_VISION_MODEL", "qwen3-vl-flash"),
     )

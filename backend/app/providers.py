@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .config import get_settings
+from .config import get_settings, rerank_endpoint_url
 from .privacy import get_privacy_settings
 from .credentials import available as credential_store_available
 from .credentials import set_secret
@@ -99,19 +99,35 @@ def test_provider(provider: str) -> dict:
         if provider == "dashscope-rerank":
             if not settings.dashscope_api_key or not settings.dashscope_rerank_base_url:
                 return _failure(provider, "not_configured", "请先配置百炼 API Key 和 Rerank 工作空间地址")
-            response = httpx.post(
-                f"{settings.dashscope_rerank_base_url}/reranks",
-                headers={"Authorization": f"Bearer {settings.dashscope_api_key}"},
-                json={
+            if settings.rerank_model == "gte-rerank-v2":
+                request_body = {
+                    "model": settings.rerank_model,
+                    "input": {
+                        "query": "KUN connection test",
+                        "documents": ["KUN connection test", "unrelated document"],
+                    },
+                    "parameters": {"return_documents": True, "top_n": 2},
+                }
+            else:
+                request_body = {
                     "model": settings.rerank_model,
                     "query": "KUN connection test",
                     "documents": ["KUN connection test", "unrelated document"],
                     "top_n": 2,
-                },
+                }
+            response = httpx.post(
+                rerank_endpoint_url(settings, settings.rerank_model),
+                headers={"Authorization": f"Bearer {settings.dashscope_api_key}"},
+                json=request_body,
                 timeout=30,
             )
             response.raise_for_status()
-            results = response.json().get("results", [])
+            response_body = response.json()
+            results = (
+                (response_body.get("output") or {}).get("results", [])
+                if settings.rerank_model == "gte-rerank-v2"
+                else response_body.get("results", [])
+            )
             if not results or "relevance_score" not in results[0]:
                 return _failure(provider, "invalid_response", "Rerank 返回格式异常")
             return _success(provider, settings.rerank_model, result_count=len(results))

@@ -13,7 +13,7 @@ from uuid import uuid4
 import httpx
 import numpy as np
 
-from .config import get_settings
+from .config import get_settings, rerank_endpoint_url
 from .database import connect, json_value, now, rows
 from .infra import JobContext, create_trace, finish_trace, trace_span
 from .privacy import allowed_for_cloud
@@ -50,7 +50,7 @@ class RetrievalConfig:
             top_k=max(1, min(int(value.get("top_k", 5)), 20)),
             reranker_top_n=max(10, min(int(value.get("reranker_top_n", 10)), 50)),
             rrf_k=max(1, min(int(value.get("rrf_k", 60)), 200)),
-            reranker_model=value.get("reranker_model") or ("qwen3-rerank" if pipeline == "hybrid_rerank" else None),
+            reranker_model=value.get("reranker_model") or ("gte-rerank-v2" if pipeline == "hybrid_rerank" else None),
         )
 
 
@@ -137,7 +137,7 @@ class DashScopeEmbeddingAdapter:
 class DashScopeRerankerAdapter:
     provider = "dashscope"
 
-    def __init__(self, model: str = "qwen3-rerank") -> None:
+    def __init__(self, model: str = "gte-rerank-v2") -> None:
         self.settings = get_settings()
         self.model = model
 
@@ -181,21 +181,48 @@ class DashScopeRerankerAdapter:
                 "provider_duration_ms": 0,
             }
         provider_started = perf_counter()
-        response = httpx.post(
-            f"{self.settings.dashscope_rerank_base_url}/reranks",
-            headers={"Authorization": f"Bearer {self.settings.dashscope_api_key}"},
-            json={
+        if self.model == "gte-rerank-v2":
+            request_body = {
+                "model": self.model,
+                "input": {
+                    "query": query,
+                    "documents": [item["text"] for item in candidates],
+                },
+                "parameters": {"return_documents": True, "top_n": bounded_top_n},
+            }
+        else:
+            request_body = {
                 "model": self.model,
                 "query": query,
                 "documents": [item["text"] for item in candidates],
                 "top_n": bounded_top_n,
                 "instruct": "Given a search query, retrieve passages that directly answer the query.",
-            },
+            }
+        response = httpx.post(
+            rerank_endpoint_url(self.settings, self.model),
+            headers={"Authorization": f"Bearer {self.settings.dashscope_api_key}"},
+            json=request_body,
             timeout=90,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            detail = ""
+            try:
+                body = response.json()
+                detail = str(body.get("code") or body.get("message") or body.get("request_id") or "").strip()[:180]
+            except (ValueError, TypeError):
+                detail = response.text[:180].strip()
+            raise RuntimeError(
+                f"DashScope rerank HTTP {response.status_code}"
+                f"{(': ' + detail) if detail else ''}"
+            ) from error
         payload = response.json()
-        results = payload.get("results") or []
+        results = (
+            (payload.get("output") or {}).get("results") or []
+            if self.model == "gte-rerank-v2"
+            else payload.get("results") or []
+        )
         with connect() as db:
             db.execute(
                 "INSERT OR REPLACE INTO eval_rerank_cache(query_hash,candidate_hash,model,top_n,result_json,created_at) VALUES(?,?,?,?,?,?)",
@@ -312,6 +339,7 @@ def create_index_generation(
     if chunk_overlap >= chunk_size:
         raise ValueError("Chunk overlap must be smaller than chunk size")
     documents = _source_documents(space_id)
+    allowed_document_ids = allowed_for_cloud([item["id"] for item in documents], "embedding")
     config = {
         "space_id": space_id,
         "provider": "dashscope",
@@ -323,6 +351,10 @@ def create_index_generation(
         "parser_version": PARSER_VERSION,
         "chunker_version": CHUNKER_VERSION,
         "source_fingerprints": [item["fingerprint"] for item in documents],
+        # Cloud consent is part of the effective corpus.  Without this field,
+        # granting Embedding permission to a new document would reuse an old
+        # generation whose vectors were built from the previously allowed set.
+        "embedding_allowed_document_ids": sorted(allowed_document_ids),
     }
     config_hash = hashlib.sha256(json_value(config).encode("utf-8")).hexdigest()
     existing = rows(
@@ -525,9 +557,13 @@ def build_index_generation(generation_id: str, context: JobContext) -> dict[str,
             "config_hash": generation["config_hash"],
             "vector_count": len(chunks),
             "created_at": now(),
+            "document_ids": sorted({item["document_id"] for item in chunks}),
             "document_fingerprints": [item["fingerprint"] for item in rows(
-                "SELECT fingerprint FROM documents WHERE space_id=? ORDER BY id", (generation["space_id"],)
-            )],
+                "SELECT fingerprint FROM documents WHERE id IN ({}) ORDER BY id".format(
+                    ",".join("?" for _ in sorted({item["document_id"] for item in chunks}))
+                ),
+                tuple(sorted({item["document_id"] for item in chunks})),
+            )] if chunks else [],
         }
         manifest_path = folder / "manifest.json"
         manifest_temp = folder / "manifest.json.tmp"

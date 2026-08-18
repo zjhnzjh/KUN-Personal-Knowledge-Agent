@@ -176,7 +176,12 @@ def search(query: str, space_id: str, top_k: int = 5) -> list[dict]:
         candidates = {row["id"]: {**dict(row), "lexical_rank": rank} for rank, row in enumerate(lexical, 1)}
         provider = DashScopeEmbeddings()
         if provider.available:
-            query_vectors = provider.encode([query], "query")
+            try:
+                query_vectors = provider.encode([query], "query")
+            except RuntimeError:
+                # The local search path remains usable when the optional provider is
+                # unavailable. This is an explicit BM25 fallback, never a fake vector.
+                query_vectors = []
             if query_vectors:
                 vector_rows = db.execute(
                     """SELECT c.id,c.document_id,c.locator,c.heading,c.text,c.embedding_json,

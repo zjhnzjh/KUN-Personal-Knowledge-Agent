@@ -166,6 +166,7 @@ type AgentTrace = {
 type InfraJob = {
   id: string; job_type: string; status: string; phase: string; progress: number; message: string;
   attempt: number; max_attempts: number; error_code?: string | null; created_at: string; updated_at: string;
+  payload?: { generation_id?: string };
 };
 type InfraTrace = {
   id: string; trace_type: string; name: string; status: string; duration_ms?: number | null; started_at: string;
@@ -179,10 +180,19 @@ type IndexGeneration = {
 };
 type EvalDataset = {
   id: string; name: string; version: string; status: string; case_count: number; accepted_count?: number; draft_count?: number; rejected_count?: number;
-  cases?: Array<{ id: string; question: string; status: string; split: string; query_type: string; difficulty: string; gold: Array<{ title: string; locator: string; relevance: number }> }>;
+  target_case_count?: number; holdout_count?: number; formal_ready?: number; source_documents?: string[];
+  splits?: { dev: number; holdout: number }; case_mix?: Record<string, number>;
+  cases?: Array<{ id: string; question: string; answer?: string; status: string; split: string; query_type: string; difficulty: string; source_type?: string; validation?: { valid?: boolean; issues?: string[]; warnings?: string[] }; gold: Array<{ title: string; locator: string; relevance: number }> }>;
+};
+type DatasetReadiness = {
+  dataset_id: string; accepted_count: number; draft_count: number; rejected_count: number;
+  dev_count: number; holdout_count: number; source_document_count: number;
+  query_types: Record<string, number>; formal_ready: boolean;
+  checks: Array<{ name: string; required: number; actual: number; passed: boolean }>;
+  next_actions: string[];
 };
 type Experiment = {
-  id: string; name: string; status: string; dataset_version_id: string; created_at: string; finished_at?: string | null; config: Record<string, unknown>;
+  id: string; name: string; display_name?: string; status: string; dataset_version_id: string; created_at: string; finished_at?: string | null; config: Record<string, unknown>;
   config_hash?: string; git_revision?: string; machine?: Record<string, unknown>;
   summary: { case_count?: number; document_recall?: Record<string, number>; evidence_recall?: Record<string, number>; mrr?: number; ndcg_10?: number; citation_resolvable_rate?: number; latency_ms?: Record<string, number>; latency_breakdown?: Record<string, Record<string, number>>; api_stats?: Record<string, number>; stage_recall?: Record<string, { document_recall: Record<string, number>; evidence_recall: Record<string, number> }>; evaluation_scope?: string; failure_counts?: Record<string, number>; query_types?: Record<string, { evidence_recall: number; case_count: number }>; dataset?: { name?: string; version?: string; content_hash?: string } };
   cases?: Array<{ case_id: string; question: string; failure_category?: string | null; latency_ms: number; metrics: Record<string, unknown>; rankings: { returned?: Array<Record<string, unknown>> } }>;
@@ -196,7 +206,7 @@ type ExperimentSweep = {
   id: string; name: string; status: string; dataset_version_id: string; case_status: string;
   estimated_requests: number; estimated_input_characters: number; created_at: string;
   item_counts?: Record<string, number>; total_items?: number; completed_items?: number;
-  items?: Array<{ ordinal: number; run_id: string; status: string; name: string; config: Record<string, unknown>; summary: Experiment["summary"]; error_code?: string | null }>;
+  items?: Array<{ ordinal: number; run_id: string; status: string; name: string; display_name?: string; config: Record<string, unknown>; summary: Experiment["summary"]; error_code?: string | null }>;
 };
 type InfraOverview = {
   generated_at: string; jobs: Record<string, number>; traces: { total: number; succeeded: number; failed: number; average_ms?: number | null; p95_ms?: number | null };
@@ -239,6 +249,11 @@ function formatSize(bytes: number) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function indexGenerationLabel(item: IndexGeneration) {
+  const active = item.is_active ? " · 当前激活" : "";
+  return `${item.model} · ${item.dimension}d · ${item.chunk_size}/${item.chunk_overlap} · ${item.vector_count.toLocaleString()} chunks${active}`;
+}
+
 function formatDate(value: string) {
   if (!value) return "—";
   return new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value));
@@ -251,7 +266,60 @@ function experimentQualityScore(item: Experiment) {
 
 function experimentPipelineLabel(item: Experiment) {
   const pipeline = String(item.config?.pipeline || "bm25");
-  return ({ bm25: "BM25", dense: "Dense", hybrid: "Hybrid + RRF", hybrid_rerank: "Hybrid + Rerank" } as Record<string, string>)[pipeline] || pipeline;
+  return ({
+    bm25: "BM25",
+    dense: "Dense",
+    hybrid: "Hybrid",
+    hybrid_rerank: "Hybrid + Rerank",
+  } as Record<string, string>)[pipeline] || pipeline;
+}
+
+function experimentPipelineNote(item: Experiment) {
+  const pipeline = String(item.config?.pipeline || "bm25");
+  return ({
+    bm25: "本地词法检索",
+    dense: "Embedding + FAISS",
+    hybrid: "BM25 + Dense + RRF",
+    hybrid_rerank: "RRF 后重排",
+  } as Record<string, string>)[pipeline] || "检索流程";
+}
+
+function experimentDisplayName(item: Pick<Experiment, "name" | "display_name">) {
+  return item.display_name || item.name;
+}
+
+function experimentConfigHeadline(item: Experiment) {
+  const config = item.config || {};
+  if (config.pipeline === "bm25") return "本地 BM25";
+  const snapshot = (config.index_snapshot || {}) as Record<string, unknown>;
+  const model = String(snapshot.model || config.embedding_model || "Embedding");
+  const dimension = snapshot.dimension ? `${snapshot.dimension}d` : "向量索引";
+  return `${model} · ${dimension}`;
+}
+
+function experimentCaseLabel(item: Experiment) {
+  const count = item.summary?.case_count;
+  if (typeof count !== "number" || count <= 0) return item.config?.case_status === "exploratory" ? "exploratory" : "accepted";
+  return `${count} ${item.config?.case_status === "exploratory" ? "exploratory" : "Gold"}`;
+}
+
+function experimentConfigChips(item: Experiment) {
+  const config = item.config || {};
+  const snapshot = (config.index_snapshot || {}) as Record<string, unknown>;
+  const chips: Array<{ label: string; value: string }> = [];
+  if (snapshot.chunk_size !== undefined && snapshot.chunk_overlap !== undefined) {
+    chips.push({ label: "Chunk", value: `${snapshot.chunk_size}/${snapshot.chunk_overlap}` });
+  }
+  chips.push({ label: "cand", value: String(config.candidate_k ?? 20) });
+  chips.push({ label: "top", value: String(config.top_k ?? 10) });
+  if (config.pipeline === "hybrid" || config.pipeline === "hybrid_rerank") {
+    chips.push({ label: "RRF", value: String(config.rrf_k ?? 60) });
+  }
+  if (config.pipeline === "hybrid_rerank") {
+    chips.push({ label: "rerank", value: String(config.reranker_top_n ?? 10) });
+  }
+  chips.push({ label: "data", value: experimentCaseLabel(item) });
+  return chips;
 }
 
 function metricPercent(value?: number) {
@@ -1383,13 +1451,11 @@ function ExperimentHistory({
     {experimentView === "leaderboard" ? <div className="table-responsive experiment-history-table-wrap"><div className="experiment-history-table">
       <div className="experiment-history-head"><span>选择</span><span>排名</span><span>运行 / 配置</span><span>Pipeline</span><span>Evidence R@5</span><span>MRR</span><span>nDCG@10</span><span>P95</span><span>状态</span><span>操作</span></div>
       {leaderboardExperiments.map((item, index) => {
-        const generation = indexes.find((entry) => entry.id === String(item.config?.generation_id || ""));
-        const model = generation?.model || String(item.config?.embedding_model || (item.config?.pipeline === "bm25" ? "本地 BM25" : "向量索引"));
         return <div className={`experiment-history-row ${compareExperimentIds.includes(item.id) ? "selected" : ""}`} key={item.id}>
-          <label className="experiment-check"><input type="checkbox" checked={compareExperimentIds.includes(item.id)} onChange={() => onToggleCompare(item.id)} /><span className="sr-only">选择 {item.name}</span></label>
+          <label className="experiment-check"><input type="checkbox" checked={compareExperimentIds.includes(item.id)} onChange={() => onToggleCompare(item.id)} /><span className="sr-only">选择 {experimentDisplayName(item)}</span></label>
           <strong className="experiment-rank">#{index + 1}</strong>
-          <span className="experiment-run-name"><b>{item.name}</b><small>{formatDate(item.created_at)} · {model}{generation ? ` · ${generation.dimension}d` : ""}</small></span>
-          <span>{experimentPipelineLabel(item)}</span>
+          <span className="experiment-run-name" title={experimentDisplayName(item)}><b>{experimentConfigHeadline(item)}</b><small>{formatDate(item.created_at)} · {experimentCaseLabel(item)}</small><span className="experiment-config-chips">{experimentConfigChips(item).map((chip) => <i key={`${chip.label}-${chip.value}`}><em>{chip.label}</em><strong>{chip.value}</strong></i>)}</span></span>
+          <span className="experiment-pipeline-cell"><b>{experimentPipelineLabel(item)}</b><small>{experimentPipelineNote(item)}</small></span>
           <strong>{metricPercent(item.summary.evidence_recall?.["5"])}</strong>
           <strong>{metricNumber(item.summary.mrr)}</strong>
           <strong>{metricNumber(item.summary.ndcg_10)}</strong>
@@ -1400,16 +1466,51 @@ function ExperimentHistory({
       })}
       {!leaderboardExperiments.length && <p className="infra-empty">还没有成功的 Gold 评测运行。完成一次实验后，这里会自动形成可复现榜单。</p>}
     </div></div> : compareExperiments.length < 2 ? <div className="experiment-compare-empty"><strong>先在排行榜勾选至少 2 次运行</strong><p>建议选择同一数据集、只改变一个变量的运行，例如 1024d 与 256d，或 Hybrid 与 Hybrid + Rerank。</p><button onClick={() => onViewChange("leaderboard")}>返回排行榜选择</button></div> : <div className="experiment-comparison">
-      <div className="experiment-compare-context"><span>对比基线</span><strong>{baseline?.name}</strong><small>左侧第一项作为基线，其余运行显示相对差值。</small></div>
-      <div className="experiment-compare-cards">{compareExperiments.map((item, index) => <article key={item.id} className={index === 0 ? "baseline" : ""}><span>{index === 0 ? "BASELINE" : `CANDIDATE ${index}`}</span><strong>{item.name}</strong><small>{experimentPipelineLabel(item)} · {String(item.config?.split || "all")} · {item.summary.case_count || 0} cases</small><small>config {String(item.config_hash || "—").slice(0, 10)} · git {String(item.git_revision || "—").slice(0, 10)}</small><a href={`${API_BASE}/api/eval/experiments/${item.id}/report?format=markdown`} target="_blank" rel="noreferrer">打开完整报告 ↗</a></article>)}</div>
-      <div className="experiment-metric-matrix" role="table" aria-label="实验指标对比矩阵"><div className="experiment-matrix-head"><strong>指标</strong>{compareExperiments.map((item) => <span key={item.id}>{item.name}</span>)}</div>{metrics.map((metric) => <div className="experiment-matrix-row" key={metric.label}><strong>{metric.label}</strong>{compareExperiments.map((item) => { const value = metric.value(item); const numeric = typeof value === "number" ? value : 0; const width = Math.max(0, Math.min(100, numeric / metric.max * 100)); return <span key={item.id}><b>{metric.format(value)}</b><i><em style={{ width: `${width}%` }} /></i></span>; })}</div>)}</div>
-      <div className="experiment-delta-list">{baseline && compareExperiments.slice(1).map((item) => { const qualityDelta = (item.summary.evidence_recall?.["5"] || 0) - (baseline.summary.evidence_recall?.["5"] || 0); const latencyDelta = (item.summary.latency_ms?.p95 || 0) - (baseline.summary.latency_ms?.p95 || 0); return <article key={item.id}><span><b>{item.name}</b><small>相对 {baseline.name}</small></span><strong className={qualityDelta >= 0 ? "positive" : "negative"}>Evidence R@5 {qualityDelta >= 0 ? "+" : ""}{(qualityDelta * 100).toFixed(1)} pp</strong><strong className={latencyDelta <= 0 ? "positive" : "negative"}>P95 {latencyDelta >= 0 ? "+" : ""}{Math.round(latencyDelta)} ms</strong></article>; })}</div>
+      <div className="experiment-compare-context"><span>对比基线</span><strong>{baseline ? experimentConfigHeadline(baseline) : "—"}</strong><small>左侧第一项作为基线，其余运行显示相对差值。</small></div>
+      <div className="experiment-compare-cards">{compareExperiments.map((item, index) => <article key={item.id} className={index === 0 ? "baseline" : ""}><span>{index === 0 ? "BASELINE" : `CANDIDATE ${index}`}</span><strong>{experimentConfigHeadline(item)}</strong><small className="compare-pipeline-label">{experimentPipelineLabel(item)} · {experimentPipelineNote(item)}</small><div className="experiment-config-chips">{experimentConfigChips(item).map((chip) => <i key={`${chip.label}-${chip.value}`}><em>{chip.label}</em><strong>{chip.value}</strong></i>)}</div><small>config {String(item.config_hash || "—").slice(0, 10)} · git {String(item.git_revision || "—").slice(0, 10)}</small><a href={`${API_BASE}/api/eval/experiments/${item.id}/report?format=markdown`} target="_blank" rel="noreferrer">打开完整报告 ↗</a></article>)}</div>
+      <div className="experiment-metric-matrix" role="table" aria-label="实验指标对比矩阵"><div className="experiment-matrix-head"><strong>指标</strong>{compareExperiments.map((item) => <span key={item.id}>{experimentConfigHeadline(item)}</span>)}</div>{metrics.map((metric) => <div className="experiment-matrix-row" key={metric.label}><strong>{metric.label}</strong>{compareExperiments.map((item) => { const value = metric.value(item); const numeric = typeof value === "number" ? value : 0; const width = Math.max(0, Math.min(100, numeric / metric.max * 100)); return <span key={item.id}><b>{metric.format(value)}</b><i><em style={{ width: `${width}%` }} /></i></span>; })}</div>)}</div>
+      <div className="experiment-delta-list">{baseline && compareExperiments.slice(1).map((item) => { const qualityDelta = (item.summary.evidence_recall?.["5"] || 0) - (baseline.summary.evidence_recall?.["5"] || 0); const latencyDelta = (item.summary.latency_ms?.p95 || 0) - (baseline.summary.latency_ms?.p95 || 0); return <article key={item.id}><span><b>{experimentConfigHeadline(item)}</b><small>相对 {experimentConfigHeadline(baseline)}</small></span><strong className={qualityDelta >= 0 ? "positive" : "negative"}>Evidence R@5 {qualityDelta >= 0 ? "+" : ""}{(qualityDelta * 100).toFixed(1)} pp</strong><strong className={latencyDelta <= 0 ? "positive" : "negative"}>P95 {latencyDelta >= 0 ? "+" : ""}{Math.round(latencyDelta)} ms</strong></article>; })}</div>
       <div className="experiment-insights">
-        <article><span>阶段 Evidence Recall@5</span>{compareExperiments.map((item) => <div key={item.id} className="stage-recall-row"><b>{item.name}</b><span>{["bm25", "dense", "fusion", "rerank"].map((stage) => { const value = item.summary.stage_recall?.[stage]?.evidence_recall?.["5"]; return <i key={stage} title={`${stage} 阶段`}>{stage.slice(0, 3).toUpperCase()} {metricPercent(value)}</i>; })}</span></div>)}</article>
-        <article><span>延迟拆分（质量结果不被 Provider 延迟否决）</span>{compareExperiments.map((item) => { const breakdown = item.summary.latency_breakdown || {}; const total = Math.max(1, Number(item.summary.latency_ms?.mean || 0)); return <div key={item.id} className="latency-breakdown-row"><b>{item.name}</b><div>{[["local_bm25_ms", "BM25"], ["local_faiss_ms", "FAISS"], ["embedding_provider_ms", "Embedding"], ["local_rrf_ms", "RRF"], ["rerank_provider_ms", "Rerank"]].map(([key, label]) => <i key={key} style={{ width: `${Math.min(100, Number(breakdown[key]?.mean || 0) / total * 100)}%` }} title={`${label}: ${Math.round(Number(breakdown[key]?.mean || 0))} ms`} />)}</div><small>{Math.round(total)} ms total</small></div>; })}</article>
-        <article><span>质量 / 总延迟 Pareto 视图</span><div className="pareto-chart">{compareExperiments.map((item) => { const quality = Number(item.summary.evidence_recall?.["5"] || 0); const latency = Number(item.summary.latency_ms?.mean || 0); const max = Math.max(1, ...compareExperiments.map((entry) => Number(entry.summary.latency_ms?.mean || 0))); return <i key={item.id} style={{ left: `${quality * 92 + 2}%`, bottom: `${Math.max(4, 100 - latency / max * 82)}%` }} title={`${item.name} · Recall ${metricPercent(quality)} · ${Math.round(latency)} ms`}><em>{item.name.slice(0, 10)}</em></i>; })}<small className="pareto-x">Evidence Recall@5 →</small><small className="pareto-y">总延迟 ↑</small></div></article>
+        <article><span>阶段 Evidence Recall@5</span>{compareExperiments.map((item) => <div key={item.id} className="stage-recall-row"><b>{experimentConfigHeadline(item)}</b><span>{["bm25", "dense", "fusion", "rerank"].map((stage) => { const value = item.summary.stage_recall?.[stage]?.evidence_recall?.["5"]; return <i key={stage} title={`${stage} 阶段`}>{stage.slice(0, 3).toUpperCase()} {metricPercent(value)}</i>; })}</span></div>)}</article>
+        <article><span>延迟拆分（质量结果不被 Provider 延迟否决）</span>{compareExperiments.map((item) => { const breakdown = item.summary.latency_breakdown || {}; const total = Math.max(1, Number(item.summary.latency_ms?.mean || 0)); return <div key={item.id} className="latency-breakdown-row"><b>{experimentConfigHeadline(item)}</b><div>{[["local_bm25_ms", "BM25"], ["local_faiss_ms", "FAISS"], ["embedding_provider_ms", "Embedding"], ["local_rrf_ms", "RRF"], ["rerank_provider_ms", "Rerank"]].map(([key, label]) => <i key={key} style={{ width: `${Math.min(100, Number(breakdown[key]?.mean || 0) / total * 100)}%` }} title={`${label}: ${Math.round(Number(breakdown[key]?.mean || 0))} ms`} />)}</div><small>{Math.round(total)} ms total</small></div>; })}</article>
+        <article><span>质量 / 总延迟 Pareto 视图</span><div className="pareto-chart">{compareExperiments.map((item) => { const quality = Number(item.summary.evidence_recall?.["5"] || 0); const latency = Number(item.summary.latency_ms?.mean || 0); const max = Math.max(1, ...compareExperiments.map((entry) => Number(entry.summary.latency_ms?.mean || 0))); const shortName = experimentConfigHeadline(item); return <i key={item.id} style={{ left: `${quality * 92 + 2}%`, bottom: `${Math.max(4, 100 - latency / max * 82)}%` }} title={`${shortName} · Recall ${metricPercent(quality)} · ${Math.round(latency)} ms`}><em>{shortName.slice(0, 16)}</em></i>; })}<small className="pareto-x">Evidence Recall@5 →</small><small className="pareto-y">总延迟 ↑</small></div></article>
       </div>
     </div>}
+  </section>;
+}
+
+function DatasetReadinessPanel({ dataset, readiness, onFinalize }: { dataset: EvalDataset; readiness: DatasetReadiness | null; onFinalize: () => void }) {
+  const accepted = readiness?.accepted_count ?? dataset.accepted_count ?? 0;
+  const drafts = readiness?.draft_count ?? dataset.draft_count ?? 0;
+  const holdout = readiness?.holdout_count ?? dataset.splits?.holdout ?? 0;
+  const checks = readiness?.checks || [];
+  return <section className="infra-panel dataset-readiness-panel">
+    <header><div><span>BENCHMARK READINESS</span><h2>{dataset.name} · 100 Gold 评测集</h2><p>accepted 才进入正式质量指标；draft 只用于探索。完成后固定为 70 dev / 30 holdout。</p></div><b className={readiness?.formal_ready ? "infra-status ready" : "infra-status pending"}>{readiness?.formal_ready ? "FORMAL READY" : `${accepted} / 100 ACCEPTED`}</b></header>
+    <div className="dataset-readiness-grid"><div><strong>{accepted}</strong><span>Accepted Gold</span></div><div><strong>{drafts}</strong><span>待人工确认 Draft</span></div><div><strong>{dataset.source_documents?.length || readiness?.source_document_count || 0}</strong><span>来源文档</span></div><div><strong>{holdout}</strong><span>Holdout / 30</span></div></div>
+    <div className="dataset-readiness-checks">{checks.map((check) => <span className={check.passed ? "passed" : "waiting"} key={check.name}><i>{check.passed ? "✓" : "!"}</i>{check.name}: {check.actual}/{check.required}</span>)}</div>
+    <footer><small>{readiness?.next_actions?.length ? `下一步：${readiness.next_actions.join("、")}` : "数据集已满足正式 Benchmark 条件。"}</small><button className="primary-button" disabled={Boolean(readiness?.formal_ready) || accepted < 100} onClick={onFinalize}>锁定 70 / 30 留出集</button></footer>
+  </section>;
+}
+
+function DatasetCaseReviewPanel({
+  dataset,
+  edits,
+  onEdit,
+  onReview,
+}: {
+  dataset: EvalDataset;
+  edits: Record<string, { question: string; answer: string; query_type: string; difficulty: string; split: string }>;
+  onEdit: (id: string, patch: Partial<{ question: string; answer: string; query_type: string; difficulty: string; split: string }>) => void;
+  onReview: (id: string, status: "accepted" | "rejected") => void;
+}) {
+  const drafts = (dataset.cases || []).filter((item) => item.status === "draft");
+  if (!drafts.length) return null;
+  return <section className="infra-panel dataset-review-panel">
+    <header><div><span>HUMAN GOLD REVIEW</span><h2>逐条确认候选题</h2><p>检查问题是否清晰、答案是否被原文支持、Gold Chunk 和定位是否正确；确认后才会计入正式指标。</p></div><b>{drafts.length} DRAFTS</b></header>
+    <div className="dataset-review-list">{drafts.map((item, index) => {
+      const edit = edits[item.id] || { question: item.question, answer: item.answer || "", query_type: item.query_type, difficulty: item.difficulty, split: item.split };
+      return <details key={item.id} open={index === 0}><summary><span>#{String(index + 1).padStart(2, "0")}</span><strong>{item.question}</strong><small>{item.query_type} · {item.difficulty}</small></summary><div className="dataset-review-form"><label>问题<input value={edit.question} onChange={(event) => onEdit(item.id, { question: event.target.value })} /></label><label>参考答案<textarea value={edit.answer} onChange={(event) => onEdit(item.id, { answer: event.target.value })} /></label><div><label>问题类型<select value={edit.query_type} onChange={(event) => onEdit(item.id, { query_type: event.target.value })}><option value="fact">直接事实</option><option value="paraphrase">语义改写</option><option value="cross_page">跨段落/跨页</option><option value="table">表格/数字</option><option value="distractor">相似干扰</option></select></label><label>难度<select value={edit.difficulty} onChange={(event) => onEdit(item.id, { difficulty: event.target.value })}><option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option></select></label><label>实验分组<select value={edit.split} onChange={(event) => onEdit(item.id, { split: event.target.value })}><option value="dev">Dev</option><option value="holdout">Holdout</option></select></label></div><p className="dataset-gold-source">Gold：{item.gold?.map((gold) => `${gold.title} · ${gold.locator}`).join("；") || "未设置"}</p><footer><button onClick={() => onReview(item.id, "rejected")}>拒绝候选</button><button className="primary-button" onClick={() => onReview(item.id, "accepted")}>确认 Gold</button></footer></div></details>;
+    })}</div>
   </section>;
 }
 
@@ -1428,10 +1529,22 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
   const [infraBudget, setInfraBudget] = useState<InfraBudget>({ max_api_requests_per_run: 500, max_embedding_input_characters: 5_000_000, allow_multi_model_rebuild: true });
   const [selectedTrace, setSelectedTrace] = useState<InfraTrace | null>(null);
   const [selectedDataset, setSelectedDataset] = useState<EvalDataset | null>(null);
+  const [datasetReadiness, setDatasetReadiness] = useState<DatasetReadiness | null>(null);
+  const [caseEdits, setCaseEdits] = useState<Record<string, { question: string; answer: string; query_type: string; difficulty: string; split: string }>>({});
   const [selectedExperiment, setSelectedExperiment] = useState<Experiment | null>(null);
   const [experimentView, setExperimentView] = useState<"leaderboard" | "compare">("leaderboard");
   const [compareExperimentIds, setCompareExperimentIds] = useState<string[]>([]);
   const [plannedIndex, setPlannedIndex] = useState<IndexGeneration | null>(null);
+  const [pairBuildIds, setPairBuildIds] = useState<string[]>(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const saved = window.localStorage.getItem("kun-ai-infra-pair-build-ids");
+      return saved ? JSON.parse(saved) as string[] : [];
+    } catch {
+      return [];
+    }
+  });
+  const [pairBuildPhase, setPairBuildPhase] = useState<"idle" | "planning" | "building">("idle");
   const [duel, setDuel] = useState<DuelResult | null>(null);
   const [regression, setRegression] = useState<RegressionResult | null>(null);
   const [busy, setBusy] = useState("");
@@ -1441,7 +1554,8 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
   const [indexStrategy, setIndexStrategy] = useState("flat");
   const [chunkPreset, setChunkPreset] = useState("700:120");
   const [experimentPipeline, setExperimentPipeline] = useState("bm25");
-  const [experimentIndex, setExperimentIndex] = useState("");
+  // null means "not chosen yet"; an empty string is a deliberate BM25-only choice.
+  const [experimentIndex, setExperimentIndex] = useState<string | null>(null);
   const [experimentCandidateK, setExperimentCandidateK] = useState(20);
   const [experimentTopK, setExperimentTopK] = useState(10);
   const [experimentRrfK, setExperimentRrfK] = useState(60);
@@ -1461,7 +1575,34 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
     [successfulExperiments],
   );
   const compareExperiments = compareExperimentIds.map((id) => experiments.find((item) => item.id === id)).filter(Boolean) as Experiment[];
-  const selectedIndexId = experimentIndex || readyIndexes[0]?.id || "";
+  const selectedIndexId = experimentIndex === null
+    ? (experimentPipeline === "bm25" ? "" : readyIndexes[0]?.id || "")
+    : experimentIndex;
+  const pairProgress = [1024, 256].map((dimension) => {
+    const generationId = pairBuildIds.find((id) => indexes.find((item) => item.id === id)?.dimension === dimension);
+    const generation = generationId ? indexes.find((item) => item.id === generationId) : undefined;
+    const job = generationId ? jobs.find((item) => item.job_type === "build_index_generation" && item.payload?.generation_id === generationId) : undefined;
+    const progress = generation?.status === "ready" || job?.status === "succeeded" ? 100 : job?.progress || (generation ? 8 : 0);
+    const phase = generation?.status === "ready" ? "已完成" : job?.phase === "embedding" ? "百炼 Embedding" : job?.phase === "faiss_build" ? "构建 FAISS" : generation ? "准备中" : "等待创建";
+    return { dimension, progress, phase, status: generation?.status || "waiting" };
+  });
+  const pairProgressVisible = pairBuildPhase !== "idle" || pairBuildIds.length > 0;
+  const pairProgressValue = pairProgress.reduce((sum, item) => sum + item.progress, 0) / pairProgress.length;
+
+  useEffect(() => {
+    try {
+      if (pairBuildIds.length) window.localStorage.setItem("kun-ai-infra-pair-build-ids", JSON.stringify(pairBuildIds));
+      else window.localStorage.removeItem("kun-ai-infra-pair-build-ids");
+    } catch {
+      // Local persistence is best effort; backend jobs remain the source of truth.
+    }
+  }, [pairBuildIds]);
+
+  useEffect(() => {
+    if (!indexes.length || !pairBuildIds.length) return;
+    const validIds = pairBuildIds.filter((id) => indexes.some((item) => item.id === id));
+    if (validIds.length !== pairBuildIds.length) setPairBuildIds(validIds);
+  }, [indexes, pairBuildIds]);
 
   async function loadInfra() {
     try {
@@ -1540,12 +1681,49 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
     });
   }
 
+  async function buildPairedIndexes() {
+    setPairBuildPhase("planning");
+    setPairBuildIds([]);
+    try {
+    if (!window.confirm(`将按当前授权资料、模型 ${indexModel}、${chunkPreset} 和 ${indexStrategy.toUpperCase()}，自动准备并构建 1024d 与 256d 两套独立索引。旧索引不会覆盖，可能产生百炼 Embedding 请求。\n\n是否继续？`)) return;
+    await runAction("build-index-pair", async () => {
+      const [chunkSize, chunkOverlap] = chunkPreset.split(":").map(Number);
+      const generations: IndexGeneration[] = [];
+      for (const dimension of [1024, 256]) {
+        const generation = await api<IndexGeneration>("/api/infra/index-generations", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ space_id: spaceId, model: indexModel, dimension, strategy: indexStrategy, chunk_size: chunkSize, chunk_overlap: chunkOverlap }),
+        });
+        generations.push(generation);
+        setPairBuildIds((current) => [...current.filter((id) => id !== generation.id), generation.id]);
+        if (generation.status !== "ready") {
+          setPairBuildPhase("building");
+          await api(`/api/infra/index-generations/${generation.id}/build`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ confirmation: "重建此索引" }),
+          });
+        }
+      }
+      const allReady = generations.length === 2 && generations.every((item) => item.status === "ready");
+      setNotice(allReady
+        ? "相同配置的 1024d 与 256d 索引已经存在，系统按配置哈希复用它们，没有覆盖或重复创建。"
+        : `双索引任务已提交：${generations.map((item) => `${item.dimension}d`).join("、")}。可在索引代次和 Cockpit 查看进度。`);
+    });
+    } finally {
+      setPairBuildPhase("idle");
+    }
+  }
+
   async function openTrace(id: string) {
     await runAction(`trace-${id}`, async () => setSelectedTrace(await api<InfraTrace>(`/api/infra/traces/${id}`)));
   }
 
   async function openDataset(id: string) {
-    await runAction(`dataset-${id}`, async () => setSelectedDataset(await api<EvalDataset>(`/api/eval/datasets/${id}`)));
+    await runAction(`dataset-${id}`, async () => {
+      const item = await api<EvalDataset>(`/api/eval/datasets/${id}`);
+      setSelectedDataset(item);
+      setDatasetReadiness(await api<DatasetReadiness>(`/api/eval/datasets/${id}/readiness`));
+    });
   }
 
   async function importLegacyDataset() {
@@ -1559,8 +1737,8 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
     const name = window.prompt("评测集名称", "KUN Gold Set 100")?.trim();
     if (!name) return;
     await runAction("create-dataset", async () => {
-      const item = await api<EvalDataset>("/api/eval/datasets", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ space_id: spaceId, name, version: "v1" }) });
-      setSelectedDataset(item);
+      const item = await api<EvalDataset>("/api/eval/datasets/import-legacy", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ space_id: spaceId, name, version: "v2" }) });
+      setSelectedDataset(item); setDatasetReadiness(await api<DatasetReadiness>(`/api/eval/datasets/${item.id}/readiness`));
     });
   }
 
@@ -1569,16 +1747,46 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
     const confirmation = window.prompt("候选题会把有限文档片段发送给 DeepSeek，生成后仍是 draft。\n\n请输入：生成候选题");
     if (confirmation !== "生成候选题") return;
     await runAction("generate-candidates", async () => {
-      await api(`/api/eval/datasets/${selectedDataset.id}/generate-candidates`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ count: 70, confirmation }) });
+      await api(`/api/eval/datasets/${selectedDataset.id}/generate-candidates`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ count: Math.max(1, 100 - (selectedDataset.accepted_count || 0)), confirmation }) });
       setNotice("70 条 exploratory 候选已进入后台队列，完成后请逐条确认；未确认数据不会进入正式 Gold 指标。");
+    });
+  }
+
+  async function autoAcceptCandidates() {
+    if (!selectedDataset) return;
+    await runAction("auto-accept", async () => {
+      await api(`/api/eval/datasets/${selectedDataset.id}/auto-accept`, { method: "POST" });
+      setNotice("一键自动确认已入队：系统会用 DeepSeek 对每条 Gold 证据生成参考答案，仅通过证据校验的候选才会升级为 accepted。");
     });
   }
 
   async function reviewCase(caseId: string, status: "accepted" | "rejected") {
     if (!selectedDataset) return;
-    await runAction(`case-${caseId}`, async () => setSelectedDataset(await api<EvalDataset>(`/api/eval/datasets/${selectedDataset.id}/cases/${caseId}`, {
-      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }),
-    })));
+    const current = selectedDataset.cases?.find((item) => item.id === caseId);
+    const edit = caseEdits[caseId];
+    await runAction(`case-${caseId}`, async () => {
+      const updated = await api<EvalDataset>(`/api/eval/datasets/${selectedDataset.id}/cases/${caseId}`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+          status, question: edit?.question || current?.question, answer: edit?.answer || current?.answer || "",
+          query_type: edit?.query_type || current?.query_type, difficulty: edit?.difficulty || current?.difficulty,
+          split: edit?.split || current?.split || "dev",
+        }),
+      });
+      setSelectedDataset(updated);
+      setDatasetReadiness(await api<DatasetReadiness>(`/api/eval/datasets/${updated.id}/readiness`));
+    });
+  }
+
+  async function finalizeSelectedDataset() {
+    if (!selectedDataset) return;
+    await runAction("finalize-dataset", async () => {
+      const item = await api<DatasetReadiness>(`/api/eval/datasets/${selectedDataset.id}/finalize`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ holdout_count: 30, seed: 20260814 }),
+      });
+      setDatasetReadiness(item);
+      setSelectedDataset(await api<EvalDataset>(`/api/eval/datasets/${selectedDataset.id}`));
+      setNotice("100 条 Gold 已锁定为 70 dev / 30 holdout，可开始正式 Benchmark。");
+    });
   }
 
   async function startExperiment() {
@@ -1590,7 +1798,7 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
       await api("/api/eval/experiments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
         dataset_version_id: dataset.id, name, pipeline: experimentPipeline,
         generation_id: selectedIndexId || null, candidate_k: experimentCandidateK, top_k: experimentTopK, rrf_k: experimentRrfK,
-        reranker_model: experimentPipeline === "hybrid_rerank" ? "qwen3-rerank" : null, reranker_top_n: experimentRerankerTopN, split: "all", case_status: experimentCaseStatus,
+        reranker_model: experimentPipeline === "hybrid_rerank" ? "gte-rerank-v2" : null, reranker_top_n: experimentRerankerTopN, split: "all", case_status: experimentCaseStatus,
       }) });
       setNotice("质量实验已入队。运行期间每道题都会保留排名、阶段耗时和 Trace。");
     });
@@ -1604,7 +1812,7 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
       { name: "BM25 local baseline", pipeline: "bm25", generation_id: null, candidate_k: 20, top_k: 10, rrf_k: 60, split: "all" },
       { name: "Dense current index", pipeline: "dense", generation_id: selectedIndexId, candidate_k: 20, top_k: 10, rrf_k: 60, split: "all" },
       { name: "Hybrid RRF current index", pipeline: "hybrid", generation_id: selectedIndexId, candidate_k: 20, top_k: 10, rrf_k: 60, split: "all" },
-      { name: "Hybrid Rerank current index", pipeline: "hybrid_rerank", generation_id: selectedIndexId, candidate_k: 20, top_k: 10, rrf_k: 60, reranker_model: "qwen3-rerank", reranker_top_n: 10, split: "all" },
+      { name: "Hybrid Rerank current index", pipeline: "hybrid_rerank", generation_id: selectedIndexId, candidate_k: 20, top_k: 10, rrf_k: 60, reranker_model: "gte-rerank-v2", reranker_top_n: 10, split: "all" },
       ...[10, 50].map((candidate_k) => ({ name: `Hybrid candidate K=${candidate_k}`, pipeline: "hybrid", generation_id: selectedIndexId, candidate_k, top_k: 10, rrf_k: 60, split: "all" })),
     ];
     if (!window.confirm(`将串行运行 ${configs.length} 个真实检索实验，范围：${experimentCaseStatus === "accepted" ? "30 accepted Gold" : "accepted + draft exploratory"}。是否开始？`)) return;
@@ -1631,11 +1839,15 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
 
   async function runDuel() {
     if (!duelQuestion.trim()) return;
+    if ((duelLeft !== "bm25" || duelRight !== "bm25") && !selectedIndexId) {
+      setNotice("Dense、Hybrid 或 Rerank 对决需要先选择一套已就绪的向量索引。");
+      return;
+    }
     await runAction("duel", async () => setDuel(await api<DuelResult>("/api/infra/retrieval-duel", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
         question: duelQuestion, space_id: spaceId,
         left: { pipeline: duelLeft, generation_id: duelLeft === "bm25" ? selectedIndexId || null : selectedIndexId, candidate_k: 20, top_k: 10 },
-        right: { pipeline: duelRight, generation_id: selectedIndexId, candidate_k: 20, top_k: 10, reranker_model: duelRight === "hybrid_rerank" ? "qwen3-rerank" : null },
+        right: { pipeline: duelRight, generation_id: selectedIndexId, candidate_k: 20, top_k: 10, reranker_model: duelRight === "hybrid_rerank" ? "gte-rerank-v2" : null },
       }),
     })));
   }
@@ -1659,6 +1871,8 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
   const maxSpan = Math.max(1, ...(selectedTrace?.spans || []).map((item) => Number(item.duration_ms || 0)));
 
   return <div className="page infra-page">
+    {tab === "experiments" && selectedDataset && <DatasetReadinessPanel dataset={selectedDataset} readiness={datasetReadiness} onFinalize={() => void finalizeSelectedDataset()} />}
+    {tab === "experiments" && selectedDataset && <DatasetCaseReviewPanel dataset={selectedDataset} edits={caseEdits} onEdit={(id, patch) => setCaseEdits((current) => ({ ...current, [id]: { question: current[id]?.question || selectedDataset.cases?.find((item) => item.id === id)?.question || "", answer: current[id]?.answer || selectedDataset.cases?.find((item) => item.id === id)?.answer || "", query_type: current[id]?.query_type || selectedDataset.cases?.find((item) => item.id === id)?.query_type || "fact", difficulty: current[id]?.difficulty || selectedDataset.cases?.find((item) => item.id === id)?.difficulty || "medium", split: current[id]?.split || selectedDataset.cases?.find((item) => item.id === id)?.split || "dev", ...patch } }))} onReview={(id, status) => void reviewCase(id, status)} />}
     <PageHead eyebrow="AI INFRA OBSERVABILITY" title="从请求到回归结论，都能被解释" description={`当前空间：${activeSpace?.name || "默认空间"}。质量 Gold 与确定性向量压测严格分开。`} action={<span className={`infra-live ${health ? "online" : ""}`}><i />{health ? "LIVE" : "OFFLINE"}</span>} />
     <nav className="infra-tabs">{[
       ["cockpit", "Cockpit"], ["traces", "Trace Explorer"], ["experiments", "Experiment Studio"], ["duel", "Retrieval Duel"], ["gate", "Regression Gate"],
@@ -1680,7 +1894,7 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
         <section className="infra-panel"><header><div><span>PERSISTENT RUNNER</span><h2>任务与恢复</h2></div><b>{jobs.filter((item) => ["queued","running","retry_wait"].includes(item.status)).length} ACTIVE</b></header><div className="infra-job-list">{jobs.slice(0, 7).map((job) => <article key={job.id}><i className={`job-${job.status}`} /><div><strong>{job.job_type.replaceAll("_", " ")}</strong><p>{job.message || job.phase}</p><span><b style={{ width: `${job.progress}%` }} /></span></div><aside><b>{job.progress}%</b><small>尝试 {job.attempt}/{job.max_attempts}</small></aside></article>)}{!jobs.length && <p className="infra-empty">队列为空，启动索引或实验后会显示真实进度。</p>}</div></section>
         <section className="infra-panel"><header><div><span>INDEX GENERATIONS</span><h2>索引代次与回滚</h2></div><b>{readyIndexes.length} READY</b></header><div className="infra-index-list">{indexes.slice(0, 6).map((item) => <article key={item.id}><div><strong>{item.model}</strong><p>{item.dimension}d · {item.strategy.toUpperCase()} · Chunk {item.chunk_size}/{item.chunk_overlap}</p></div><span className={`infra-status ${item.status}`}>{item.is_active ? "ACTIVE" : item.status.toUpperCase()}</span><small>{item.vector_count.toLocaleString()} vectors · {formatSize(item.index_bytes || 0)}</small>{item.status === "ready" && !item.is_active && <button onClick={() => void runAction(`activate-${item.id}`, async () => { await api(`/api/infra/index-generations/${item.id}/activate`, { method: "POST" }); })}>切换</button>}</article>)}{!indexes.length && <p className="infra-empty">还没有索引代次。下方配置只会在你确认后产生云端请求。</p>}</div></section>
       </div>
-      <section className="infra-builder"><header><div><span>IMMUTABLE INDEX BUILDER</span><h2>建立可验证、可切换的索引代次</h2></div><p>模型、维度、Chunk 与源文档指纹共同决定代次；不会覆盖现有索引。</p></header><div className="infra-form-grid"><label>Embedding<select value={indexModel} onChange={(event) => setIndexModel(event.target.value)}>{(modelCatalog?.embedding || [{ model: "text-embedding-v4", dimensions: [256, 1024] }]).map((item) => <option value={item.model} key={item.model}>{item.model}</option>)}</select><input value={indexModel} onChange={(event) => setIndexModel(event.target.value)} placeholder="也可手动输入模型 Code" /></label><label>维度<select value={indexDimension} onChange={(event) => setIndexDimension(Number(event.target.value))}>{(modelCatalog?.embedding.find((item) => item.model === indexModel)?.dimensions || [256, 512, 768, 1024]).map((dimension) => <option value={dimension} key={dimension}>{dimension}</option>)}</select></label><label>Chunk / overlap<select value={chunkPreset} onChange={(event) => setChunkPreset(event.target.value)}><option value="400:80">400 / 80</option><option value="700:120">700 / 120</option><option value="1000:150">1000 / 150</option></select></label><label>FAISS<select value={indexStrategy} onChange={(event) => setIndexStrategy(event.target.value)}><option value="flat">Flat · 精确</option><option value="hnsw">HNSW · ANN</option></select></label><button className="secondary-button" disabled={Boolean(busy)} onClick={() => void planGeneration()}>{busy === "plan-index" ? "计算中…" : "计算重建计划"}</button></div>{plannedIndex && <div className="infra-estimate"><div><span>Chunk</span><strong>{plannedIndex.estimate?.chunk_count || 0}</strong></div><div><span>API 批次</span><strong>{plannedIndex.estimate?.estimated_batches || 0}</strong></div><div><span>缓存命中</span><strong>{Math.round((plannedIndex.estimate?.cache_hit_rate || 0) * 100)}%</strong></div><div><span>重发字符</span><strong>{(plannedIndex.estimate?.estimated_input_characters || 0).toLocaleString()}</strong></div><div><span>费用口径</span><strong>{plannedIndex.estimate?.cost_status === "estimated" ? "估算" : "实际"}</strong></div><button className="primary-button" disabled={Boolean(busy)} onClick={() => void buildGeneration()}>确认并入队</button></div>}</section>
+      <section className="infra-builder"><header><div><span>IMMUTABLE INDEX BUILDER</span><h2>建立可验证、可切换的索引代次</h2></div><p>模型、维度、Chunk 与源文档指纹共同决定代次；不会覆盖现有索引。</p></header><div className="infra-form-grid"><label>Embedding<select value={indexModel} onChange={(event) => setIndexModel(event.target.value)}>{(modelCatalog?.embedding || [{ model: "text-embedding-v4", dimensions: [256, 1024] }]).map((item) => <option value={item.model} key={item.model}>{item.model}</option>)}</select><input value={indexModel} onChange={(event) => setIndexModel(event.target.value)} placeholder="也可手动输入模型 Code" /></label><label>维度<select value={indexDimension} onChange={(event) => setIndexDimension(Number(event.target.value))}>{(modelCatalog?.embedding.find((item) => item.model === indexModel)?.dimensions || [256, 512, 768, 1024]).map((dimension) => <option value={dimension} key={dimension}>{dimension}</option>)}</select></label><label>Chunk / overlap<select value={chunkPreset} onChange={(event) => setChunkPreset(event.target.value)}><option value="400:80">400 / 80</option><option value="700:120">700 / 120</option><option value="1000:150">1000 / 150</option></select></label><label>FAISS<select value={indexStrategy} onChange={(event) => setIndexStrategy(event.target.value)}><option value="flat">Flat · 精确</option><option value="hnsw">HNSW · ANN</option></select></label><button className="secondary-button" disabled={Boolean(busy)} onClick={() => void planGeneration()}>{busy === "plan-index" ? "计算中…" : "计算重建计划"}</button><button className="primary-button index-pair-button" disabled={Boolean(busy)} onClick={() => void buildPairedIndexes()}>{busy === "build-index-pair" ? "双索引构建中…" : "一键构建 1024d + 256d"}</button></div><p className="index-pair-help">按当前授权资料自动创建两套同配置索引；下拉框会显示实际 Chunk 数，方便区分旧版与新版。</p>{pairProgressVisible && <div className="index-pair-progress"><header><strong>双索引构建进度</strong><span>{pairProgressValue >= 100 ? "已完成" : `${Math.round(pairProgressValue)}%`}</span></header><div className="index-pair-progress-track"><i style={{ width: `${Math.min(100, Math.max(4, pairProgressValue))}%` }} /></div>{pairBuildPhase === "planning" && <p>正在估算 Chunk、缓存命中和百炼请求量…</p>}<div className="index-pair-progress-grid">{pairProgress.map((item) => <div key={item.dimension}><span><b>{item.dimension}d</b><small>{item.phase}</small></span><strong>{item.progress}%</strong><div><i style={{ width: `${item.progress}%` }} /></div></div>)}</div></div>}{plannedIndex && <div className="infra-estimate"><div><span>Chunk</span><strong>{plannedIndex.estimate?.chunk_count || 0}</strong></div><div><span>API 批次</span><strong>{plannedIndex.estimate?.estimated_batches || 0}</strong></div><div><span>缓存命中</span><strong>{Math.round((plannedIndex.estimate?.cache_hit_rate || 0) * 100)}%</strong></div><div><span>重发字符</span><strong>{(plannedIndex.estimate?.estimated_input_characters || 0).toLocaleString()}</strong></div><div><span>费用口径</span><strong>{plannedIndex.estimate?.cost_status === "estimated" ? "估算" : "实际"}</strong></div><button className="primary-button" disabled={Boolean(busy)} onClick={() => void buildGeneration()}>确认并入队</button></div>}</section>
       <section className="infra-panel cloud-policy-panel"><header><div><span>DATA EGRESS POLICY</span><h2>逐份资料授权云端处理</h2></div><b>{cloudPolicies.filter((item) => item.embedding_allowed || item.llm_allowed).length} / {cloudPolicies.length} ALLOWED</b></header><p>默认全部关闭。Embedding 授权控制发送 Chunk 到百炼；LLM 授权控制发送检索片段给 DeepSeek，包括候选题生成。</p><div className="infra-budget-row"><label>单次 API 请求上限<input type="number" min={1} max={10000} value={infraBudget.max_api_requests_per_run} onChange={(event) => setInfraBudget({ ...infraBudget, max_api_requests_per_run: Number(event.target.value) })} /></label><label>单次发送字符上限<input type="number" min={1000} max={100000000} value={infraBudget.max_embedding_input_characters} onChange={(event) => setInfraBudget({ ...infraBudget, max_embedding_input_characters: Number(event.target.value) })} /></label><label><input type="checkbox" checked={infraBudget.allow_multi_model_rebuild} onChange={(event) => setInfraBudget({ ...infraBudget, allow_multi_model_rebuild: event.target.checked })} /> 允许多模型重复建索引</label><button onClick={() => void saveInfraBudget()}>保存预算</button></div><div>{cloudPolicies.map((item) => <article key={item.document_id}><span><strong>{item.title}</strong><small>{item.original_name}</small></span><label><input type="checkbox" checked={Boolean(item.embedding_allowed)} onChange={(event) => void updateCloudPolicy(item, "embedding", event.target.checked)} /> 百炼 Embedding</label><label><input type="checkbox" checked={Boolean(item.llm_allowed)} onChange={(event) => void updateCloudPolicy(item, "llm", event.target.checked)} /> DeepSeek LLM</label></article>)}{!cloudPolicies.length && <p className="infra-empty">当前空间没有资料。添加资料后，必须在这里明确允许才会发送到云端。</p>}</div></section>
     </>}
 
@@ -1688,16 +1902,16 @@ function InfraView({ activeSpace, health }: { activeSpace?: Space; health: Healt
 
     {tab === "experiments" && <>
       <div className="quality-separation"><div><b>QUALITY TRACK</b><strong>人工 Gold · 真实文档</strong><p>用于 Recall、MRR、nDCG、Bad Case；候选题未经确认不计分。</p></div><i>≠</i><div><b>PERFORMANCE TRACK</b><strong>确定性生成向量</strong><p>只用于延迟、QPS、内存和 ANN Recall，不宣称检索准确率。</p></div></div>
-      <div className="infra-two-columns experiment-top"><section className="infra-panel"><header><div><span>DATASET VERSIONING</span><h2>Gold 数据集</h2></div><div><button onClick={() => void importLegacyDataset()}>导入现有题</button><button onClick={() => void createCandidateDataset()}>新建</button></div></header><div className="dataset-list">{datasets.map((item) => <button key={item.id} className={selectedDataset?.id === item.id ? "selected" : ""} onClick={() => void openDataset(item.id)}><span><strong>{item.name} <i>{item.version}</i></strong><small>{item.accepted_count || 0} accepted · {item.draft_count || 0} draft</small></span><b>{item.status}</b></button>)}{!datasets.length && <p className="infra-empty">可先导入已有 30 条题，或创建 100 条 Gold 工作集。</p>}</div></section><section className="infra-panel"><header><div><span>EXPERIMENT CONFIG</span><h2>一次只改变一个变量</h2></div><b>REPRODUCIBLE</b></header><div className="experiment-controls"><label>Pipeline<select value={experimentPipeline} onChange={(event) => setExperimentPipeline(event.target.value)}><option value="bm25">BM25</option><option value="dense">Dense</option><option value="hybrid">BM25 + Dense + RRF</option><option value="hybrid_rerank">Hybrid + qwen3-rerank</option></select></label><label>索引代次<select value={selectedIndexId} onChange={(event) => setExperimentIndex(event.target.value)}><option value="">BM25 不使用向量索引</option>{readyIndexes.map((item) => <option value={item.id} key={item.id}>{item.model} · {item.dimension}d · {item.chunk_size}/{item.chunk_overlap}</option>)}</select></label><label>Candidate K<select value={experimentCandidateK} onChange={(event) => setExperimentCandidateK(Number(event.target.value))}><option value={10}>10</option><option value={20}>20</option><option value={50}>50</option></select></label><label>最终 Top K<select value={experimentTopK} onChange={(event) => setExperimentTopK(Number(event.target.value))}><option value={5}>5</option><option value={10}>10</option><option value={20}>20</option></select></label><label>RRF K<input type="number" min={1} max={200} value={experimentRrfK} onChange={(event) => setExperimentRrfK(Number(event.target.value))} /></label><label>Rerank Top N<input type="number" min={10} max={50} value={experimentRerankerTopN} onChange={(event) => setExperimentRerankerTopN(Number(event.target.value))} /></label><label>评测范围<select value={experimentCaseStatus} onChange={(event) => setExperimentCaseStatus(event.target.value as "accepted" | "exploratory")}><option value="accepted">30 accepted Gold</option><option value="exploratory">accepted + draft exploratory</option></select></label><button className="primary-button" disabled={Boolean(busy) || !datasets.length} onClick={() => void startExperiment()}>{busy === "experiment" ? "入队中…" : "运行单个实验"}</button><button className="secondary-button" disabled={Boolean(busy) || !datasets.length || !readyIndexes.length} onClick={() => void createSweep()}>{busy === "sweep" ? "Sweep 入队中…" : "运行对比 Sweep"}</button></div><p className="experiment-rule">Candidate K 是第一阶段候选数；Top K 是最终上下文数。质量评测仍保留独立 Top10，Provider 延迟只做拆分记录。</p></section></div>
-      {selectedDataset && <section className="infra-panel gold-workbench"><header><div><span>HUMAN REVIEW</span><h2>{selectedDataset.name} · 人工 Gold 工作台</h2></div><div><b>{selectedDataset.cases?.filter((item) => item.status === "accepted").length || 0} / 100</b><button disabled={Boolean(busy)} onClick={() => void generateCandidates()}>＋ 生成 70 条 exploratory</button></div></header><div>{(selectedDataset.cases || []).slice(0, 20).map((item, index) => <article key={item.id}><i>{String(index + 1).padStart(2, "0")}</i><span><strong>{item.question}</strong><small>{item.query_type} · {item.difficulty} · {item.gold?.[0]?.title} {item.gold?.[0]?.locator}</small></span><b className={`case-${item.status}`}>{item.status}</b>{item.status === "draft" && <aside><button onClick={() => void reviewCase(item.id, "rejected")}>拒绝</button><button onClick={() => void reviewCase(item.id, "accepted")}>确认 Gold</button></aside>}</article>)}</div></section>}
+      <div className="infra-two-columns experiment-top"><section className="infra-panel"><header><div><span>DATASET VERSIONING</span><h2>Gold 数据集</h2></div><div><button onClick={() => void importLegacyDataset()}>导入现有题</button><button onClick={() => void createCandidateDataset()}>新建</button></div></header><div className="dataset-list">{datasets.map((item) => <button key={item.id} className={selectedDataset?.id === item.id ? "selected" : ""} onClick={() => void openDataset(item.id)}><span><strong>{item.name} <i>{item.version}</i></strong><small>{item.accepted_count || 0} accepted · {item.draft_count || 0} draft</small></span><b>{item.status}</b></button>)}{!datasets.length && <p className="infra-empty">可先导入已有 30 条题，或创建 100 条 Gold 工作集。</p>}</div></section><section className="infra-panel"><header><div><span>EXPERIMENT CONFIG</span><h2>一次只改变一个变量</h2></div><b>REPRODUCIBLE</b></header><div className="experiment-controls"><label>Pipeline<select value={experimentPipeline} onChange={(event) => { const next = event.target.value; setExperimentPipeline(next); if (next === "bm25") setExperimentIndex(""); else if (experimentIndex === "") setExperimentIndex(null); }}><option value="bm25">BM25 · 词法检索（本地）</option><option value="dense">Dense · 向量检索（Embedding + FAISS）</option><option value="hybrid">Hybrid · BM25 + Dense + RRF</option><option value="hybrid_rerank">Hybrid + Rerank · 融合后重排</option></select></label><label>索引代次<select value={selectedIndexId} onChange={(event) => setExperimentIndex(event.target.value)}><option value="">BM25 不使用向量索引</option>{readyIndexes.map((item) => <option value={item.id} key={item.id}>{indexGenerationLabel(item)}</option>)}</select></label><label>Candidate K · 第一阶段候选<select value={experimentCandidateK} onChange={(event) => setExperimentCandidateK(Number(event.target.value))}><option value={10}>10</option><option value={20}>20</option><option value={50}>50</option></select></label><label>最终 Top K · 最终结果<select value={experimentTopK} onChange={(event) => setExperimentTopK(Number(event.target.value))}><option value={5}>5</option><option value={10}>10</option><option value={20}>20</option></select></label><label title="RRF 不改变候选数；K 越小越强调各路排名靠前的结果，K 越大越平滑。默认 60。">RRF K · 融合平滑<input type="number" min={1} max={200} value={experimentRrfK} onChange={(event) => setExperimentRrfK(Number(event.target.value))} /></label><label>Rerank Top N · 重排输入<input type="number" min={10} max={50} value={experimentRerankerTopN} onChange={(event) => setExperimentRerankerTopN(Number(event.target.value))} /></label><label>评测范围<select value={experimentCaseStatus} onChange={(event) => setExperimentCaseStatus(event.target.value as "accepted" | "exploratory")}><option value="accepted">30 accepted Gold</option><option value="exploratory">accepted + draft exploratory</option></select></label><button className="primary-button" disabled={Boolean(busy) || !datasets.length} onClick={() => void startExperiment()}>{busy === "experiment" ? "入队中…" : "运行单个实验"}</button><button className="secondary-button" disabled={Boolean(busy) || !datasets.length || !readyIndexes.length} onClick={() => void createSweep()}>{busy === "sweep" ? "Sweep 入队中…" : "运行对比 Sweep"}</button></div><p className="experiment-rule">Hybrid 先用 BM25 与 Dense 检索，再用 RRF 融合；开启 Rerank 时，会对融合后的候选继续重排。Candidate K、Top K、RRF K 是三个不同参数。</p><div className="experiment-parameter-guide"><span><b>cand</b><small>第一阶段候选</small></span><span><b>top</b><small>最终返回结果</small></span><span><b>RRF</b><small>多路排名融合平滑</small></span><span><b>rerank</b><small>重排输入候选</small></span></div></section></div>
+      {selectedDataset && <section className="infra-panel gold-workbench"><header><div><span>HUMAN REVIEW</span><h2>{selectedDataset.name} · 人工 Gold 工作台</h2></div><div><b>{selectedDataset.cases?.filter((item) => item.status === "accepted").length || 0} / 100</b><button className="primary-button" disabled={Boolean(busy) || !selectedDataset.cases?.some((item) => item.status === "draft")} onClick={() => void autoAcceptCandidates()}>{selectedDataset.cases?.some((item) => item.status === "draft") ? "一键自动确认 Draft" : "Draft 已全部确认"}</button><button disabled={Boolean(busy) || Boolean(selectedDataset.cases?.some((item) => item.status === "draft")) || (selectedDataset.cases?.length || 0) >= 100} onClick={() => void generateCandidates()}>{selectedDataset.cases?.some((item) => item.status === "draft") ? "已有候选，继续逐条确认" : `＋ 生成 ${Math.max(1, 100 - (selectedDataset.cases?.length || 0))} 条 exploratory`}</button></div></header><div>{(selectedDataset.cases || []).map((item, index) => <article key={item.id}><i>{String(index + 1).padStart(2, "0")}</i><span><strong>{item.question}</strong><small>{item.query_type} · {item.difficulty} · {item.gold?.[0]?.title} {item.gold?.[0]?.locator}</small></span><b className={`case-${item.status}`}>{item.status}</b>{item.status === "draft" && <aside><button onClick={() => void reviewCase(item.id, "rejected")}>拒绝</button><button onClick={() => void reviewCase(item.id, "accepted")}>确认 Gold</button></aside>}</article>)}</div></section>}
       {sweeps.length > 0 && <section className="infra-panel sweep-panel"><header><div><span> PERSISTED SWEEPS</span><h2>对比矩阵运行记录</h2></div><b>{sweeps.filter((item) => item.status === "succeeded").length} COMPLETED</b></header><div className="sweep-list">{sweeps.slice(0, 5).map((sweep) => <article key={sweep.id}><div><strong>{sweep.name}</strong><small>{sweep.case_status} · {sweep.total_items || 0} configs · {sweep.estimated_requests || 0} provider requests</small></div><span className={`infra-status ${sweep.status}`}>{sweep.status}</span><b>{sweep.completed_items || 0}/{sweep.total_items || 0}</b><div className="sweep-progress"><i style={{ width: `${Math.min(100, (sweep.completed_items || 0) / Math.max(1, sweep.total_items || 1) * 100)}%` }} /></div></article>)}</div></section>}
       <ExperimentHistory experiments={experiments} leaderboardExperiments={leaderboardExperiments} compareExperiments={compareExperiments} compareExperimentIds={compareExperimentIds} experimentView={experimentView} onViewChange={setExperimentView} onToggleCompare={toggleExperimentForCompare} onOpenExperiment={(id) => void openExperiment(id)} indexes={indexes} />
-      {selectedExperiment && <section className="infra-panel bad-cases"><header><div><span>BAD CASE ANALYSIS</span><h2>{selectedExperiment.name}</h2></div><button onClick={() => setSelectedExperiment(null)}>关闭</button></header><div className="metric-row">{[["Document R@5", selectedExperiment.summary.document_recall?.["5"]], ["Evidence R@5", selectedExperiment.summary.evidence_recall?.["5"]], ["MRR", selectedExperiment.summary.mrr], ["nDCG@10", selectedExperiment.summary.ndcg_10], ["Citation", selectedExperiment.summary.citation_resolvable_rate]].map(([label, value]) => <div key={String(label)}><span>{label}</span><strong>{typeof value === "number" ? `${Math.round(value * 1000) / 10}%` : "—"}</strong></div>)}</div><div className="bad-case-list">{(selectedExperiment.cases || []).filter((item) => item.failure_category).map((item) => <article key={item.case_id}><b>{item.failure_category}</b><span><strong>{item.question}</strong><small>{item.latency_ms} ms · 返回 {item.rankings.returned?.length || 0} 个候选</small></span></article>)}{!(selectedExperiment.cases || []).some((item) => item.failure_category) && <p className="infra-empty">本次运行没有 Bad Case。</p>}</div></section>}
+    {selectedExperiment && <section className="infra-panel bad-cases"><header><div><span>BAD CASE ANALYSIS</span><h2>{experimentDisplayName(selectedExperiment)}</h2></div><button onClick={() => setSelectedExperiment(null)}>关闭</button></header><div className="metric-row">{[["Document R@5", selectedExperiment.summary.document_recall?.["5"]], ["Evidence R@5", selectedExperiment.summary.evidence_recall?.["5"]], ["MRR", selectedExperiment.summary.mrr], ["nDCG@10", selectedExperiment.summary.ndcg_10], ["Citation", selectedExperiment.summary.citation_resolvable_rate]].map(([label, value]) => <div key={String(label)}><span>{label}</span><strong>{typeof value === "number" ? `${Math.round(value * 1000) / 10}%` : "—"}</strong></div>)}</div><div className="bad-case-list">{(selectedExperiment.cases || []).filter((item) => item.failure_category).map((item) => <article key={item.case_id}><b>{item.failure_category}</b><span><strong>{item.question}</strong><small>{item.latency_ms} ms · 返回 {item.rankings.returned?.length || 0} 个候选</small></span></article>)}{!(selectedExperiment.cases || []).some((item) => item.failure_category) && <p className="infra-empty">本次运行没有 Bad Case。</p>}</div></section>}
     </>}
 
-    {tab === "duel" && <><section className="duel-controls"><div><span>RETRIEVAL DUEL</span><h2>同一道题，逐阶段看排名为什么改变</h2></div><input value={duelQuestion} onChange={(event) => setDuelQuestion(event.target.value)} /><label>A<select value={duelLeft} onChange={(event) => setDuelLeft(event.target.value)}><option value="bm25">BM25</option><option value="dense">Dense</option><option value="hybrid">Hybrid</option></select></label><label>B<select value={duelRight} onChange={(event) => setDuelRight(event.target.value)}><option value="dense">Dense</option><option value="hybrid">Hybrid</option><option value="hybrid_rerank">Hybrid + Rerank</option></select></label><button className="primary-button" disabled={Boolean(busy) || !readyIndexes.length} onClick={() => void runDuel()}>{busy === "duel" ? "对比中…" : "开始对决"}</button></section>{duel ? <div className="duel-grid">{[["A", duel.left, duelLeft], ["B", duel.right, duelRight]].map(([side, result, pipeline]) => { const value = result as DuelResult["left"]; return <section className="infra-panel" key={String(side)}><header><div><span>CONFIG {side as string}</span><h2>{String(pipeline).toUpperCase()}</h2></div><b>{value.duration_ms} ms</b></header><div className="duel-stages">{value.stages.map((stage) => <span key={stage.stage}><b>{stage.stage}</b><i>{stage.duration_ms} ms</i><small>{stage.count} candidates</small></span>)}</div><div className="duel-ranking">{value.results.slice(0, 8).map((item, index) => <article key={item.id}><i>{index + 1}</i><span><strong>{item.title}</strong><p>{String(item.text || "").slice(0, 90)}</p><small>{item.locator} · lexical #{item.lexical_rank || "—"} · dense #{item.vector_rank || "—"} · rerank #{item.rerank_rank || "—"}</small></span><b>{Number(item.score || item.rerank_score || 0).toFixed(4)}</b></article>)}</div></section>; })}</div> : <div className="duel-empty"><strong>选择一个已就绪索引后开始</strong><p>两边分别生成真实 Trace；结果保留 BM25、Dense、Fusion 和 Rerank 的阶段排名。</p></div>}</>}
+    {tab === "duel" && <><section className="duel-controls"><div><span>RETRIEVAL DUEL</span><h2>同一道题，逐阶段看排名为什么改变</h2></div><input value={duelQuestion} onChange={(event) => setDuelQuestion(event.target.value)} /><label>A<select value={duelLeft} onChange={(event) => setDuelLeft(event.target.value)}><option value="bm25">BM25 · 词法检索（本地）</option><option value="dense">Dense · 向量检索</option><option value="hybrid">Hybrid · BM25 + Dense + RRF</option></select></label><label>B<select value={duelRight} onChange={(event) => setDuelRight(event.target.value)}><option value="dense">Dense · 向量检索</option><option value="hybrid">Hybrid · BM25 + Dense + RRF</option><option value="hybrid_rerank">Hybrid + Rerank · 融合后重排</option></select></label><button className="primary-button" disabled={Boolean(busy) || !readyIndexes.length} onClick={() => void runDuel()}>{busy === "duel" ? "对比中…" : "开始对决"}</button></section>{duel ? <div className="duel-grid">{[["A", duel.left, duelLeft], ["B", duel.right, duelRight]].map(([side, result, pipeline]) => { const value = result as DuelResult["left"]; return <section className="infra-panel" key={String(side)}><header><div><span>CONFIG {side as string}</span><h2>{String(pipeline).toUpperCase()}</h2></div><b>{value.duration_ms} ms</b></header><div className="duel-stages">{value.stages.map((stage) => <span key={stage.stage}><b>{stage.stage}</b><i>{stage.duration_ms} ms</i><small>{stage.count} candidates</small></span>)}</div><div className="duel-ranking">{value.results.slice(0, 8).map((item, index) => <article key={item.id}><i>{index + 1}</i><span><strong>{item.title}</strong><p>{String(item.text || "").slice(0, 90)}</p><small>{item.locator} · lexical #{item.lexical_rank || "—"} · dense #{item.vector_rank || "—"} · rerank #{item.rerank_rank || "—"}</small></span><b>{Number(item.score || item.rerank_score || 0).toFixed(4)}</b></article>)}</div></section>; })}</div> : <div className="duel-empty"><strong>选择一个已就绪索引后开始</strong><p>两边分别生成真实 Trace；结果保留 BM25、Dense、RRF Fusion 和 Rerank 的阶段排名。</p></div>}</>}
 
-    {tab === "gate" && <><div className="infra-two-columns"><section className="infra-panel regression-config"><header><div><span>REGRESSION GATE</span><h2>候选版本不能悄悄变差</h2></div><b>{regression?.status === "passed" ? "QUALITY PASS" : regression ? "QUALITY BLOCK" : "WAITING"}</b></header><p className="experiment-rule">质量下降才会 BLOCK；百炼 Provider 变慢会显示为 advisory，不会把真实召回结果判成失败。</p><label>Baseline<select value={baselineId} onChange={(event) => setBaselineId(event.target.value)}><option value="">选择基线实验</option>{successfulExperiments.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>Candidate<select value={candidateId} onChange={(event) => setCandidateId(event.target.value)}><option value="">选择候选实验</option>{successfulExperiments.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><button className="primary-button" disabled={!baselineId || !candidateId || Boolean(busy)} onClick={() => void compareRuns()}>运行回归比较</button>{regression && <div className="gate-checks">{regression.checks.map((check) => <article key={check.name}><i>{check.status === "passed" ? "✓" : check.status === "failed" ? "!" : "·"}</i><span><strong>{check.name}</strong><small>{check.rule}</small></span><b>{check.delta > 0 ? "+" : ""}{check.delta}</b></article>)}</div>}</section><section className="infra-panel performance-lab"><header><div><span>PERFORMANCE BENCHMARK</span><h2>FAISS 规模压测</h2></div><b>NO QUALITY CLAIM</b></header><p>生成固定 seed 的 1k / 10k 向量，对比 Flat 与 HNSW 的构建时间、P50/P95/P99、QPS 和 ANN Recall。</p><button className="secondary-button" disabled={Boolean(busy)} onClick={() => void runBenchmark()}>{busy === "benchmark" ? "入队中…" : "运行 1k / 10k 压测"}</button><div className="benchmark-list">{benchmarks.slice(0, 4).map((item) => <article key={item.id}><span><strong>{(item.config.sizes || []).map((value: number) => value.toLocaleString()).join(" / ")} vectors</strong><small>{item.config.dimension}d · seed {item.config.seed}</small></span><b className={`infra-status ${item.status}`}>{item.status}</b>{item.result.results?.filter((result) => result.status === "measured").map((result) => <em key={result.size}>{Number(result.size).toLocaleString()}: Flat P95 {result.flat?.p95_ms} ms · HNSW {result.hnsw?.p95_ms} ms · ANN R@10 {Math.round((result.hnsw?.ann_recall_10 || 0) * 100)}%</em>)}</article>)}</div></section></div>{regression && <section className={`regression-verdict ${regression.status}`}><i>{regression.status === "passed" ? "✓" : "!"}</i><div><span>QUALITY DECISION</span><h2>{regression.status === "passed" ? "候选配置质量通过" : "候选配置质量被阻塞"}</h2><p>Evidence Recall 差值 95% CI：[{regression.confidence.evidence_recall_delta_95_ci.join(", ")}] · Provider 延迟只作旁路信息。</p></div></section>}</>}
+    {tab === "gate" && <><div className="infra-two-columns"><section className="infra-panel regression-config"><header><div><span>REGRESSION GATE</span><h2>候选版本不能悄悄变差</h2></div><b>{regression?.status === "passed" ? "QUALITY PASS" : regression ? "QUALITY BLOCK" : "WAITING"}</b></header><p className="experiment-rule">质量下降才会 BLOCK；百炼 Provider 变慢会显示为 advisory，不会把真实召回结果判成失败。</p><label>Baseline<select value={baselineId} onChange={(event) => setBaselineId(event.target.value)}><option value="">选择基线实验</option>{successfulExperiments.map((item) => <option value={item.id} key={item.id}>{experimentDisplayName(item)}</option>)}</select></label><label>Candidate<select value={candidateId} onChange={(event) => setCandidateId(event.target.value)}><option value="">选择候选实验</option>{successfulExperiments.map((item) => <option value={item.id} key={item.id}>{experimentDisplayName(item)}</option>)}</select></label><button className="primary-button" disabled={!baselineId || !candidateId || Boolean(busy)} onClick={() => void compareRuns()}>运行回归比较</button>{regression && <div className="gate-checks">{regression.checks.map((check) => <article key={check.name}><i>{check.status === "passed" ? "✓" : check.status === "failed" ? "!" : "·"}</i><span><strong>{check.name}</strong><small>{check.rule}</small></span><b>{check.delta > 0 ? "+" : ""}{check.delta}</b></article>)}</div>}</section><section className="infra-panel performance-lab"><header><div><span>PERFORMANCE BENCHMARK</span><h2>FAISS 规模压测</h2></div><b>NO QUALITY CLAIM</b></header><p>生成固定 seed 的 1k / 10k 向量，对比 Flat 与 HNSW 的构建时间、P50/P95/P99、QPS 和 ANN Recall。</p><button className="secondary-button" disabled={Boolean(busy)} onClick={() => void runBenchmark()}>{busy === "benchmark" ? "入队中…" : "运行 1k / 10k 压测"}</button><div className="benchmark-list">{benchmarks.slice(0, 4).map((item) => <article key={item.id}><span><strong>{(item.config.sizes || []).map((value: number) => value.toLocaleString()).join(" / ")} vectors</strong><small>{item.config.dimension}d · seed {item.config.seed}</small></span><b className={`infra-status ${item.status}`}>{item.status}</b>{item.result.results?.filter((result) => result.status === "measured").map((result) => <em key={result.size}>{Number(result.size).toLocaleString()}: Flat P95 {result.flat?.p95_ms} ms · HNSW {result.hnsw?.p95_ms} ms · ANN R@10 {Math.round((result.hnsw?.ann_recall_10 || 0) * 100)}%</em>)}</article>)}</div></section></div>{regression && <section className={`regression-verdict ${regression.status}`}><i>{regression.status === "passed" ? "✓" : "!"}</i><div><span>QUALITY DECISION</span><h2>{regression.status === "passed" ? "候选配置质量通过" : "候选配置质量被阻塞"}</h2><p>Evidence Recall 差值 95% CI：[{regression.confidence.evidence_recall_delta_95_ci.join(", ")}] · Provider 延迟只作旁路信息。</p></div></section>}</>}
   </div>;
 }
 
